@@ -36,6 +36,23 @@ services:
       # - QBIT_PATH_MAP=/downloads:/media/torrents
       # - QBIT_WEBUI_URL=http://192.168.1.39:8081
       
+      # Sonarr Integration (optional)
+      # Protects files managed by Sonarr from deletion
+      # - SONARR_URL=http://sonarr:8989
+      # - SONARR_APIKEY=your-sonarr-api-key
+      # - SONARR_NAME=sonarr
+      # - SONARR_PATH_MAP=/tv:/media/plexmedia/Serien
+      
+      # Radarr Integration (optional)
+      # Protects files managed by Radarr from deletion
+      # - RADARR_URL=http://radarr:7878
+      # - RADARR_APIKEY=your-radarr-api-key
+      # - RADARR_NAME=radarr
+      # - RADARR_PATH_MAP=/movies:/media/plexmedia/Filme
+      
+      # Multiple Instances Example (JSON format):
+      # - SONARR_INSTANCES_JSON=[{"name":"main","url":"http://sonarr:8989","api_key":"key1","path_mappings":["/tv:/media/plexmedia/Serien"]},{"name":"anime","url":"http://sonarr-anime:8989","api_key":"key2","path_mappings":["/anime:/media/plexmedia/Anime"]}]
+      
       # Audit settings
       - FFPROBE_SCOPE=dupes
       - CONTENT_TYPE=auto

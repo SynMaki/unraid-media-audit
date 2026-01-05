@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <strong>📊 Scan media libraries for duplicates, manage quality upgrades, with qBittorrent protection</strong>
+  <strong>📊 Scan media libraries for duplicates, manage quality upgrades, with Sonarr/Radarr/qBittorrent protection</strong>
 </p>
 
 ---
@@ -17,7 +17,11 @@
 - **Duplicate Detection**: Find duplicate episodes/movies across multiple folders
 - **Quality Scoring**: Automatically ranks files by resolution, codec, audio quality, and language
 - **Language Preference**: Prioritizes DEU+ENG for films/series, DEU+JPN for anime
+- **Sonarr/Radarr Integration**: Protects files managed by your *arr apps from deletion
 - **qBittorrent Integration**: Protects actively seeding files from deletion
+- **Multiple Instance Support**: Connect to multiple Sonarr/Radarr instances (e.g., "Sonarr" + "Sonarr Anime")
+- **Custom Format Scores**: Display Arr custom format scores in reports
+- **Upgrade Recommendations**: Shows when quality cutoff isn't met
 - **Hardlink Awareness**: Detects and handles hardlinked files correctly
 - **Web UI Dashboard**: Easy-to-use interface for running audits and viewing reports
 - **Interactive HTML Reports**: Beautiful, sortable reports with delete commands
@@ -30,6 +34,7 @@
 - [Quick Start](#-quick-start)
 - [Unraid Installation](#-unraid-installation)
 - [Configuration](#-configuration)
+- [Sonarr/Radarr Setup](#-sonarradarr-setup)
 - [qBittorrent Setup](#-qbittorrent-setup)
 - [Usage](#-usage)
 - [Volume Mappings](#-volume-mappings)
@@ -149,21 +154,95 @@ environment:
   QBIT_WEBUI_URL: http://192.168.1.39:8081   # Link shown in reports
 ```
 
+---
+
+## 📺 Sonarr/Radarr Setup
+
+Media Audit integrates with Sonarr and Radarr to:
+- **Protect managed files**: Files actively managed by Sonarr/Radarr are never deleted
+- **Display quality info**: Shows custom format scores and quality profiles
+- **Upgrade recommendations**: Highlights files where quality cutoff isn't met
+- **Multiple instances**: Support for separate instances (e.g., "Sonarr" + "Sonarr Anime")
+
+### Single Instance Configuration
+
+```yaml
+environment:
+  # Sonarr
+  SONARR_URL: http://192.168.1.39:8989
+  SONARR_APIKEY: your-sonarr-api-key      # Settings > General > API Key
+  SONARR_PATH_MAP: /tv:/media/plexmedia/Serien
+  
+  # Radarr  
+  RADARR_URL: http://192.168.1.39:7878
+  RADARR_APIKEY: your-radarr-api-key
+  RADARR_PATH_MAP: /movies:/media/plexmedia/Filme
+```
+
+### Multiple Instances (JSON Format)
+
+For setups with multiple Sonarr/Radarr instances:
+
+```yaml
+environment:
+  SONARR_INSTANCES_JSON: |
+    [
+      {
+        "name": "main",
+        "url": "http://192.168.1.39:8989",
+        "api_key": "your-main-sonarr-key",
+        "path_mappings": ["/tv:/media/plexmedia/Serien"]
+      },
+      {
+        "name": "anime", 
+        "url": "http://192.168.1.39:8990",
+        "api_key": "your-anime-sonarr-key",
+        "path_mappings": ["/anime:/media/plexmedia/Anime"]
+      }
+    ]
+  RADARR_INSTANCES_JSON: |
+    [
+      {
+        "name": "movies",
+        "url": "http://192.168.1.39:7878",
+        "api_key": "your-radarr-key",
+        "path_mappings": ["/movies:/media/plexmedia/Filme"]
+      }
+    ]
+```
+
 ### Path Mapping Explained
 
-qBittorrent runs in a container with its own path structure. The `QBIT_PATH_MAP` tells media-audit how to translate:
+Sonarr/Radarr see paths differently than media-audit:
 
 ```
-QBIT_PATH_MAP=/downloads:/media/torrents
-             ↑ qBit container path   ↑ media-audit container path
+SONARR_PATH_MAP=/tv:/media/plexmedia/Serien
+               ↑ Sonarr's path    ↑ media-audit's path
 ```
 
 For multiple mappings, use semicolons:
 ```
-QBIT_PATH_MAP=/downloads:/media/torrents;/data/completed:/media/completed
+SONARR_PATH_MAP=/tv:/media/plexmedia/Serien;/anime:/media/plexmedia/Anime
 ```
 
+### Finding Your API Key
+
+1. Open Sonarr/Radarr web interface
+2. Go to **Settings** → **General**
+3. Under **Security**, copy the **API Key**
+
+### What Gets Protected?
+
+When Servarr integration is enabled:
+- Files listed in Sonarr's `episodeFile` are protected
+- Files listed in Radarr's `movieFile` are protected  
+- Files currently in download queue are protected
+- Protected files are marked in reports with "ARR" badge
+- Delete scripts exclude all protected files
+
 ---
+
+## 🔐 qBittorrent Setup
 
 ## 📊 Usage
 
@@ -252,6 +331,22 @@ Each audit run creates:
 | `QBIT_PATH_MAP` | (empty) | Path mapping (container:host) |
 | `QBIT_WEBUI_URL` | (empty) | URL to show in reports |
 
+### Sonarr/Radarr Integration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SONARR_URL` | (empty) | Sonarr base URL (e.g., http://192.168.1.39:8989) |
+| `SONARR_APIKEY` | (empty) | Sonarr API key |
+| `SONARR_NAME` | sonarr | Instance name for reports |
+| `SONARR_PATH_MAP` | (empty) | Path mapping (sonarr:local) |
+| `RADARR_URL` | (empty) | Radarr base URL |
+| `RADARR_APIKEY` | (empty) | Radarr API key |
+| `RADARR_NAME` | radarr | Instance name for reports |
+| `RADARR_PATH_MAP` | (empty) | Path mapping (radarr:local) |
+| `NO_SERVARR` | false | Disable all Servarr integration |
+| `SONARR_INSTANCES_JSON` | (empty) | JSON array for multiple Sonarr instances |
+| `RADARR_INSTANCES_JSON` | (empty) | JSON array for multiple Radarr instances |
+
 ### Audit Settings
 
 | Variable | Default | Description |
@@ -306,6 +401,7 @@ docker exec media-audit python /app/media_audit.py --help
 ### CLI Arguments
 
 ```
+Core Options:
 --roots PATH [PATH ...]    Directories to scan
 --report-dir PATH          Where to save reports
 --delete-under PATH        Only delete under this path
@@ -313,14 +409,42 @@ docker exec media-audit python /app/media_audit.py --help
 --content-type TYPE        auto, anime, series, movie
 --avoid-mode MODE          if-no-prefer, strict, report-only
 --avoid-audio-lang LANGS   Comma-separated language codes
+
+qBittorrent Options:
 --qbit-host HOST           qBittorrent hostname
 --qbit-port PORT           qBittorrent port
 --qbit-user USER           qBittorrent username
 --qbit-pass PASS           qBittorrent password
 --qbit-path-map MAP        Container:Host path mapping
 --no-qbit                  Disable qBittorrent integration
+
+Sonarr/Radarr Options:
+--sonarr CONFIG            Add Sonarr instance (repeatable)
+                           Format: name=NAME,url=URL,apikey=KEY,path_map=A:B
+--radarr CONFIG            Add Radarr instance (repeatable)
+--sonarr-config FILE       JSON file with Sonarr configs
+--radarr-config FILE       JSON file with Radarr configs
+--no-servarr               Disable all Sonarr/Radarr integration
+--arr-rescan               Trigger rescan after deletion
+
+Output Options:
 --html-report              Generate HTML report (default: on)
---apply --yes              Actually delete files (DANGEROUS!)
+--no-html-report           Disable HTML report
+-v, --verbose              Enable debug logging
+
+Deletion (DANGEROUS!):
+--apply --yes              Actually delete files
+```
+
+### Example CLI with Sonarr
+
+```bash
+docker exec media-audit python /app/media_audit.py \
+  --roots /media/plexmedia /media/torrents \
+  --report-dir /reports \
+  --delete-under /media/plexmedia \
+  --sonarr "name=main,url=http://sonarr:8989,apikey=YOUR_KEY,path_map=/tv:/media/plexmedia/Serien" \
+  --radarr "name=movies,url=http://radarr:7878,apikey=YOUR_KEY,path_map=/movies:/media/plexmedia/Filme"
 ```
 
 ---

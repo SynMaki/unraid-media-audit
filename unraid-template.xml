@@ -59,6 +59,16 @@ IMPORTANT: Mount your media directories as READ-ONLY for safety!</Overview>
     <Config Name="qBit Path Map" Target="QBIT_PATH_MAP" Default="/data/torrents:/media/torrents" Mode="" Description="Path mapping: qBit-container-path:media-audit-path" Type="Variable" Display="always" Required="false" Mask="false">/data/torrents:/media/torrents</Config>
     <Config Name="qBit WebUI URL" Target="QBIT_WEBUI_URL" Default="" Mode="" Description="Full URL for qBittorrent link in reports (e.g., http://192.168.1.39:8081)" Type="Variable" Display="always" Required="false" Mask="false"/>
 
+    <!-- Sonarr Integration -->
+    <Config Name="Sonarr URL" Target="SONARR_URL" Default="" Mode="" Description="Sonarr URL (e.g., http://192.168.1.39:8989) - leave empty to disable" Type="Variable" Display="always" Required="false" Mask="false"/>
+    <Config Name="Sonarr API Key" Target="SONARR_APIKEY" Default="" Mode="" Description="Sonarr API Key (Settings > General)" Type="Variable" Display="always" Required="false" Mask="true"/>
+    <Config Name="Sonarr Path Map" Target="SONARR_PATH_MAP" Default="" Mode="" Description="Path mapping: sonarr-path:media-audit-path (e.g., /tv:/media/plexmedia/Serien)" Type="Variable" Display="always" Required="false" Mask="false"/>
+    
+    <!-- Radarr Integration -->
+    <Config Name="Radarr URL" Target="RADARR_URL" Default="" Mode="" Description="Radarr URL (e.g., http://192.168.1.39:7878) - leave empty to disable" Type="Variable" Display="always" Required="false" Mask="false"/>
+    <Config Name="Radarr API Key" Target="RADARR_APIKEY" Default="" Mode="" Description="Radarr API Key (Settings > General)" Type="Variable" Display="always" Required="false" Mask="true"/>
+    <Config Name="Radarr Path Map" Target="RADARR_PATH_MAP" Default="" Mode="" Description="Path mapping: radarr-path:media-audit-path (e.g., /movies:/media/plexmedia/Filme)" Type="Variable" Display="always" Required="false" Mask="false"/>
+
     <!-- Audit Settings -->
     <Config Name="FFprobe Scope" Target="FFPROBE_SCOPE" Default="dupes" Mode="" Description="When to analyze with ffprobe: none, dupes (recommended), or all" Type="Variable" Display="advanced" Required="false" Mask="false">dupes</Config>
     <Config Name="Content Type" Target="CONTENT_TYPE" Default="auto" Mode="" Description="Force content type: auto (recommended), anime, series, or movie" Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>

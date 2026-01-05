@@ -2,8 +2,17 @@
 """
 media_audit.py — Unraid Plex/Sonarr/Torrents Audit (dry-run by default)
 
-Version: 2.3.0
+Version: 3.0.0
 Changelog:
+- 2025-01-05 [AI] v3.0.0 - Sonarr/Radarr Integration
+  - NEW: Multiple Sonarr/Radarr instance support
+  - NEW: Files managed by Arr are protected from deletion (PROTECTED)
+  - NEW: Path mapping for container vs host paths
+  - NEW: Custom format scores displayed in reports
+  - NEW: Upgrade recommendations from Arr quality profiles
+  - NEW: Report columns for arr_* metadata
+  - NEW: Optional --arr-rescan to trigger rescans after deletion
+
 - 2025-01-04 [AI] v2.3.0 - HTML Report & ffprobe improvements
   - NEW: Interactive HTML report with sortable tables and statistics
   - NEW: Better ffprobe error handling (graceful fallback to filename-only)
@@ -51,7 +60,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "2.9.0"
+VERSION = "3.0.0"
 
 # =============================================================================
 # CONFIGURATION
@@ -1005,6 +1014,23 @@ class MediaFile:
     torrent_hash: Optional[str] = None
     torrent_name: Optional[str] = None
     torrent_file_name: Optional[str] = None  # Original filename in torrent
+    
+    # Servarr (Sonarr/Radarr) integration
+    arr_managed: bool = False
+    arr_app: Optional[str] = None  # "sonarr" or "radarr"
+    arr_instance: Optional[str] = None  # Instance name
+    arr_media_id: Optional[int] = None  # seriesId or movieId
+    arr_file_id: Optional[int] = None  # episodeFileId or movieFileId
+    arr_title: Optional[str] = None  # Series/Movie title
+    arr_quality: Optional[str] = None  # Quality name from Arr
+    arr_custom_format_score: Optional[int] = None
+    arr_custom_formats: Optional[str] = None  # Comma-separated
+    arr_quality_profile: Optional[str] = None
+    arr_cutoff_not_met: bool = False
+    arr_upgrade_recommended: bool = False
+    arr_upgrade_reason: Optional[str] = None
+    arr_link: Optional[str] = None  # WebUI link (without API key)
+    arr_in_queue: bool = False  # File is in download/import queue
 
 
 # =============================================================================
@@ -2118,6 +2144,7 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
     episode_rows, delete_candidates = [], []
     ep_dupes = {k: v for k, v in ep_groups.items() if len(v) > 1}
     seeding_protected = 0
+    arr_protected = 0
 
     for (show, s, e), idxs in sorted(ep_dupes.items(), key=lambda kv: (kv[0][0].lower(), kv[0][1], kv[0][2])):
         items = [media[i] for i in idxs]
@@ -2125,10 +2152,12 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
         for m in sorted(items, key=lambda x: (-x.score, -(x.video_height or x.name_resolution or 0))):
             keep = m.path == best.path
             
-            # Add seeding info to row
+            # Add seeding and arr info to row
             row_note = m.note
             if m.is_seeding:
                 row_note = f"SEEDING:{m.torrent_name}" if m.torrent_name else "SEEDING"
+            elif m.arr_managed:
+                row_note = f"ARR:{m.arr_app}:{m.arr_instance}" if m.arr_instance else f"ARR:{m.arr_app}"
             
             episode_rows.append({
                 "show": show, "season": s, "episode": e, "absolute_ep": m.absolute_ep or "",
@@ -2141,25 +2170,50 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
                 "release_group": m.release_group or "", "keep": "YES" if keep else "no",
                 "note": row_note, "ffprobe_error": m.ffprobe_error or "",
                 "is_seeding": m.is_seeding, "torrent_name": m.torrent_name or "",
-                "torrent_file_name": m.torrent_file_name or ""
+                "torrent_file_name": m.torrent_file_name or "",
+                # Servarr fields
+                "arr_managed": m.arr_managed, "arr_app": m.arr_app or "",
+                "arr_instance": m.arr_instance or "", "arr_media_id": m.arr_media_id or "",
+                "arr_file_id": m.arr_file_id or "", "arr_title": m.arr_title or "",
+                "arr_quality": m.arr_quality or "", "arr_custom_format_score": m.arr_custom_format_score or "",
+                "arr_custom_formats": m.arr_custom_formats or "",
+                "arr_quality_profile": m.arr_quality_profile or "",
+                "arr_cutoff_not_met": m.arr_cutoff_not_met,
+                "arr_upgrade_recommended": m.arr_upgrade_recommended,
+                "arr_upgrade_reason": m.arr_upgrade_reason or "",
+                "arr_link": m.arr_link or "", "arr_in_queue": m.arr_in_queue
             })
             
-            # Only add to delete candidates if NOT seeding
+            # Only add to delete candidates if NOT seeding AND NOT arr_managed (unless keep)
             if not keep and is_path_safe_for_deletion(Path(m.path), delete_under):
+                # Skip seeding files
                 if m.is_seeding:
                     seeding_protected += 1
-                    continue  # Skip seeding files!
+                    continue
+                # Skip Arr-managed files (they are the "active" file in Sonarr/Radarr)
+                if m.arr_managed:
+                    arr_protected += 1
+                    continue
+                # Skip files in download queue
+                if m.arr_in_queue:
+                    arr_protected += 1
+                    continue
                 if m.nlink == 1 or include_hardlinked:
                     delete_candidates.append({
                         "path": m.path, "reason": f"duplicate; best={best.path}",
                         "score": m.score, "best_score": best.score, "size": m.size,
                         "lang_reason": m.lang_score_reason, "nlink": m.nlink,
                         "res": m.video_height or m.name_resolution or "",
-                        "audio_langs": ",".join(m.audio_langs or m.name_lang_hints)
+                        "audio_langs": ",".join(m.audio_langs or m.name_lang_hints),
+                        # Include arr info in delete candidates for reference
+                        "arr_managed": m.arr_managed, "arr_app": m.arr_app or "",
+                        "arr_instance": m.arr_instance or ""
                     })
     
     if seeding_protected > 0:
         LOG.info(f"Protected {seeding_protected} seeding files from deletion")
+    if arr_protected > 0:
+        LOG.info(f"Protected {arr_protected} Sonarr/Radarr managed files from deletion")
 
     # Season conflicts
     season_conflicts = []
@@ -2214,12 +2268,16 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
     # Summary
     ffprobe_errors = sum(1 for m in media if m.ffprobe_error)
     seeding_files = sum(1 for m in media if m.is_seeding)
+    arr_managed_files = sum(1 for m in media if m.arr_managed)
+    arr_upgrade_recommended = sum(1 for m in media if m.arr_upgrade_recommended)
     summary = {
         "scanned_files": len(media), "episode_duplicate_groups": len(ep_dupes),
         "dupe_files_total": len(set(i for idxs in ep_dupes.values() for i in idxs)),
         "hardlink_groups": len(hardlinked), "hardlinked_paths": sum(len(v) for v in hardlinked.values()),
         "season_folder_conflicts": len(season_conflicts), "delete_candidates_count": len(delete_candidates),
         "seeding_files_protected": seeding_protected, "seeding_files_total": seeding_files,
+        "arr_managed_files": arr_managed_files, "arr_protected": arr_protected,
+        "arr_upgrade_recommended": arr_upgrade_recommended,
         "ffprobe_scope": ffprobe_scope, "ffprobe_found": bool(fp_bin), "ffprobe_errors": ffprobe_errors,
         "avoid_mode": avoid_mode.value, "avoid_audio_langs": avoid_langs,
         "roots": [str(r) for r in roots], "delete_under": str(delete_under),
@@ -2292,6 +2350,25 @@ def parse_args():
     ap.add_argument("--no-protect-seeding", action="store_false", dest="protect_seeding")
     ap.add_argument("--no-qbit", action="store_true", help="Disable qBittorrent check")
     ap.add_argument("--verbose", "-v", action="store_true")
+    
+    # Sonarr/Radarr integration
+    ap.add_argument("--sonarr", action="append", default=[], metavar="CONFIG",
+                    help="Add Sonarr instance: name=NAME,url=URL,apikey=KEY,path_map=REMOTE:LOCAL")
+    ap.add_argument("--radarr", action="append", default=[], metavar="CONFIG",
+                    help="Add Radarr instance: name=NAME,url=URL,apikey=KEY,path_map=REMOTE:LOCAL")
+    ap.add_argument("--sonarr-config", default=os.environ.get("SONARR_CONFIG", ""),
+                    help="Path to JSON file with Sonarr instance configs")
+    ap.add_argument("--radarr-config", default=os.environ.get("RADARR_CONFIG", ""),
+                    help="Path to JSON file with Radarr instance configs")
+    ap.add_argument("--no-servarr", action="store_true", 
+                    default=os.environ.get("NO_SERVARR", "").lower() == "true",
+                    help="Disable Sonarr/Radarr integration entirely")
+    ap.add_argument("--protect-arr-managed", action="store_true", default=True,
+                    help="Protect files managed by Sonarr/Radarr (default: enabled)")
+    ap.add_argument("--no-protect-arr-managed", action="store_false", dest="protect_arr_managed")
+    ap.add_argument("--arr-rescan", action="store_true", default=False,
+                    help="Trigger Sonarr/Radarr rescan after deletion (requires --apply --yes)")
+    
     return ap.parse_args()
 
 
@@ -2421,6 +2498,95 @@ def main() -> int:
         else:
             LOG.warning("No torrent files found or qBittorrent connection failed")
 
+    # ==========================================================================
+    # Sonarr/Radarr Integration
+    # ==========================================================================
+    servarr_manager = None
+    arr_protected_count = 0
+    
+    if not args.no_servarr:
+        # Try to import servarr_client (optional module)
+        try:
+            from servarr_client import (
+                ServarrManager, ServarrInstance, ServarrType,
+                parse_instances_from_env, parse_instances_from_cli,
+                load_instances_from_json_file
+            )
+            
+            servarr_manager = ServarrManager()
+            instance_configs = []
+            
+            # Load from environment variables
+            env_instances = parse_instances_from_env()
+            instance_configs.extend(env_instances)
+            
+            # Load from CLI arguments
+            cli_instances = parse_instances_from_cli(args.sonarr, args.radarr)
+            instance_configs.extend(cli_instances)
+            
+            # Load from JSON config files
+            if args.sonarr_config and os.path.exists(args.sonarr_config):
+                file_instances = load_instances_from_json_file(args.sonarr_config)
+                for inst in file_instances:
+                    inst["type"] = "sonarr"
+                    instance_configs.append(inst)
+            
+            if args.radarr_config and os.path.exists(args.radarr_config):
+                file_instances = load_instances_from_json_file(args.radarr_config)
+                for inst in file_instances:
+                    inst["type"] = "radarr"
+                    instance_configs.append(inst)
+            
+            # Add instances
+            for cfg in instance_configs:
+                if servarr_manager.add_instance_from_config(cfg):
+                    LOG.info(f"Connected to {cfg.get('type', 'unknown')} instance: {cfg.get('name', 'unnamed')}")
+                else:
+                    LOG.warning(f"Failed to connect to {cfg.get('type', 'unknown')} instance: {cfg.get('name', 'unnamed')}")
+            
+            # Load all managed files
+            if servarr_manager.instances:
+                LOG.info("Loading managed files from Sonarr/Radarr instances...")
+                servarr_manager.load_all_files()
+                
+                # Match scanned media to Servarr managed files
+                for m in media:
+                    info = servarr_manager.get_file_info(m.path)
+                    if info:
+                        mf, instance = info
+                        m.arr_managed = True
+                        m.arr_app = instance.app_type.value
+                        m.arr_instance = instance.name
+                        m.arr_media_id = mf.media_id
+                        m.arr_file_id = mf.file_id
+                        m.arr_title = mf.media_title
+                        m.arr_quality = mf.quality
+                        m.arr_custom_format_score = mf.custom_format_score
+                        m.arr_custom_formats = ",".join(mf.custom_formats) if mf.custom_formats else None
+                        m.arr_quality_profile = mf.quality_profile_name
+                        m.arr_cutoff_not_met = mf.quality_cutoff_not_met
+                        m.arr_upgrade_recommended = mf.upgrade_recommended
+                        m.arr_upgrade_reason = mf.upgrade_reason
+                        m.arr_link = mf.webui_link
+                        arr_protected_count += 1
+                    
+                    # Check if file is in queue
+                    if servarr_manager.is_in_queue(m.path):
+                        m.arr_in_queue = True
+                
+                LOG.info(f"Matched {arr_protected_count} files to Sonarr/Radarr managed files")
+                LOG.info(f"Files in download queue: {len(servarr_manager.queue_paths)}")
+            else:
+                LOG.info("No Sonarr/Radarr instances configured")
+                servarr_manager = None
+        
+        except ImportError as e:
+            LOG.warning(f"Servarr integration not available: {e}")
+            servarr_manager = None
+        except Exception as e:
+            LOG.warning(f"Servarr integration error: {e}")
+            servarr_manager = None
+
     # Group episodes
     ep_groups: Dict[Tuple[str, int, int], List[int]] = {}
     for idx, m in enumerate(media):
@@ -2472,6 +2638,26 @@ def main() -> int:
         deleted = execute_deletions(candidates, delete_under, args.include_hardlinked, args.verbose)
         LOG.info(f"Deleted {deleted} files")
         print(f"DONE: deleted={deleted}")
+        
+        # Trigger Arr rescans if requested
+        if args.arr_rescan and servarr_manager and deleted > 0:
+            LOG.info("Triggering Sonarr/Radarr rescans...")
+            rescan_ids = set()
+            for d in candidates:
+                info = servarr_manager.get_file_info(d.get("path", ""))
+                if info:
+                    mf, instance = info
+                    rescan_ids.add((instance.name, mf.media_id, instance.app_type.value))
+            
+            for instance_name, media_id, app_type in rescan_ids:
+                client = servarr_manager.clients.get(instance_name)
+                if client:
+                    if app_type == "sonarr":
+                        if client.rescan_series(media_id):
+                            LOG.info(f"Triggered rescan for series {media_id} on {instance_name}")
+                    else:
+                        if client.rescan_movie(media_id):
+                            LOG.info(f"Triggered rescan for movie {media_id} on {instance_name}")
 
     return 0
 

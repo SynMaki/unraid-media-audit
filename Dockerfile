@@ -84,6 +84,21 @@ ENV QBIT_HOST="" \
     QBIT_PATH_MAP="" \
     QBIT_WEBUI_URL=""
 
+# Sonarr/Radarr settings (empty = disabled)
+# For multiple instances, use JSON or numbered format:
+# - SONARR_INSTANCES_JSON='[{"name":"main","url":"http://...","api_key":"..."}]'
+# - SONARR_1_URL, SONARR_1_APIKEY, SONARR_1_NAME, SONARR_1_PATH_MAP
+# - RADARR_1_URL, RADARR_1_APIKEY, etc.
+ENV SONARR_URL="" \
+    SONARR_APIKEY="" \
+    SONARR_NAME="sonarr" \
+    SONARR_PATH_MAP="" \
+    RADARR_URL="" \
+    RADARR_APIKEY="" \
+    RADARR_NAME="radarr" \
+    RADARR_PATH_MAP="" \
+    NO_SERVARR=false
+
 # Audit settings
 ENV FFPROBE_SCOPE=dupes \
     CONTENT_TYPE=auto \
