@@ -1,9 +1,9 @@
 # Media Audit - Docker Container for Unraid
 
 <p align="center">
-  <img src="https://img.shields.io/github/license/DEIN-USERNAME/media-audit?style=flat-square" alt="License">
-  <img src="https://img.shields.io/github/v/release/DEIN-USERNAME/media-audit?style=flat-square" alt="Release">
-  <img src="https://img.shields.io/github/actions/workflow/status/DEIN-USERNAME/media-audit/docker-build.yml?style=flat-square" alt="Build">
+  <img src="https://img.shields.io/github/license/SynMaki/unraid-media-audit?style=flat-square" alt="License">
+  <img src="https://img.shields.io/github/v/release/SynMaki/unraid-media-audit?style=flat-square" alt="Release">
+  <img src="https://img.shields.io/github/actions/workflow/status/SynMaki/unraid-media-audit/docker-build.yml?style=flat-square" alt="Build">
 </p>
 
 <p align="center">
@@ -46,8 +46,8 @@
 
 ```bash
 # Clone and start
-git clone https://github.com/DEIN-USERNAME/media-audit.git
-cd media-audit
+git clone https://github.com/SynMaki/unraid-media-audit.git
+cd unraid-media-audit
 
 # Create data directories
 mkdir -p data/{reports,config,media}
@@ -72,7 +72,7 @@ docker run -d \
   -v /mnt/user/data/media_audit_reports:/reports \
   -v /mnt/user/data/plexmedia:/media/plexmedia:ro \
   -v /mnt/user/data/torrents:/media/torrents:ro \
-  ghcr.io/DEIN-USERNAME/media-audit:latest
+  ghcr.io/synmaki/unraid-media-audit:latest
 ```
 
 ---
@@ -86,7 +86,15 @@ docker run -d \
 3. Configure the template settings
 4. Click **Apply**
 
-### Method 2: Manual Template
+### Method 2: Using Template URL
+
+1. Go to **Docker** → **Add Container**
+2. Click **Template** dropdown → **Add Template URL**
+3. Enter: `https://raw.githubusercontent.com/SynMaki/unraid-media-audit/main/unraid-template.xml`
+4. Fill in your passwords and paths
+5. Click **Apply**
+
+### Method 3: Manual Setup
 
 1. Go to **Docker** → **Add Container**
 2. Toggle to **Advanced View**
@@ -95,10 +103,10 @@ docker run -d \
 | Setting | Value |
 |---------|-------|
 | Name | media-audit |
-| Repository | your-registry/media-audit |
+| Repository | `ghcr.io/synmaki/unraid-media-audit:latest` |
 | Network Type | Bridge |
-| WebUI | `http://[IP]:[PORT:8080]/` |
-| Port | 8080 |
+| WebUI | `http://[IP]:[PORT:8085]/` |
+| Port | 8085 → 8080 |
 
 ### Recommended Volume Mappings for Unraid
 
@@ -161,7 +169,7 @@ QBIT_PATH_MAP=/downloads:/media/torrents;/data/completed:/media/completed
 
 ### Web UI
 
-1. Open `http://your-server:8080`
+1. Open `http://your-server:8085`
 2. Log in with your credentials
 3. Click **Start Audit** to begin scanning
 4. View the generated HTML report
@@ -278,16 +286,6 @@ Each audit run creates:
 - Sensitive values are hidden from logs
 - Never hardcode secrets in docker-compose.yml for production
 
-### Research Findings
-
-Based on research for this implementation:
-
-1. **PUID/PGID Pattern**: Following LinuxServer.io conventions for Unraid compatibility
-2. **Non-root Container**: Container runs as non-root after entrypoint setup
-3. **Read-only Mounts**: Media directories should be mounted read-only by default
-4. **tini**: Using tini as init system for proper signal handling
-5. **gosu**: Using gosu for privilege dropping (safer than sudo)
-
 ---
 
 ## 💻 CLI Usage
@@ -371,9 +369,27 @@ docker logs -f media-audit
 
 ---
 
+## 🔄 Updating
+
+When a new version is released:
+
+```bash
+# Pull latest image
+docker pull ghcr.io/synmaki/unraid-media-audit:latest
+
+# Restart container (Unraid will auto-update if configured)
+docker stop media-audit
+docker rm media-audit
+# Then recreate with same settings
+```
+
+In Unraid: Click on the container → **Check for Updates** → **Apply Update**
+
+---
+
 ## 📜 License
 
-This project is open source. See LICENSE file for details.
+This project is open source under the MIT License. See [LICENSE](LICENSE) file for details.
 
 ---
 
@@ -382,3 +398,4 @@ This project is open source. See LICENSE file for details.
 - Language scoring optimized for German/English/Japanese content
 - qBittorrent integration for torrent seeders
 - Inspired by media management needs of Plex/Sonarr/Radarr users
+- Built with FastAPI, Python, and Docker
