@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Container version="2">
+    <Name>media-audit</Name>
+    <Repository>ghcr.io/DEIN-USERNAME/media-audit:latest</Repository>
+    <Registry>https://github.com/DEIN-USERNAME/media-audit/pkgs/container/media-audit</Registry>
+    <Network>bridge</Network>
+    <Privileged>false</Privileged>
+    <Support>https://github.com/DEIN-USERNAME/media-audit/issues</Support>
+    <Project>https://github.com/DEIN-USERNAME/media-audit</Project>
+    <Overview>
+[p]Media Audit scans your Plex/Sonarr media libraries to find duplicate episodes, compare quality, and generate delete scripts.[/p]
+
+[h4]Features[/h4]
+[ul]
+  [li]Finds duplicate episodes across multiple folders[/li]
+  [li]Quality scoring by resolution, codec, audio, and language[/li]
+  [li]Language preference: DEU+ENG for films, DEU+JPN for anime[/li]
+  [li]qBittorrent integration - protects seeding files[/li]
+  [li]Interactive HTML reports with delete commands[/li]
+  [li]Safe by default - read-only scanning[/li]
+[/ul]
+
+[h4]Important[/h4]
+[p]Mount your media directories as READ-ONLY for safety. The delete_plan.sh script must be run manually.[/p]
+    </Overview>
+    <Category>Tools: MediaApp:Other</Category>
+    <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+    <TemplateURL>https://raw.githubusercontent.com/DEIN-USERNAME/unraid-templates/main/media-audit.xml</TemplateURL>
+    <Icon>https://raw.githubusercontent.com/DEIN-USERNAME/media-audit/main/icon.png</Icon>
+    <ExtraParams/>
+    <PostArgs/>
+    <DonateText/>
+    <DonateLink/>
+    <DonateImg/>
+    <Beta>True</Beta>
+    <Shell>bash</Shell>
+    <Date>2025-01-05</Date>
+
+    <!-- PUID/PGID for Unraid -->
+    <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID for file permissions. Use 'id username' to find yours." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+    <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID for file permissions." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+    <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="File permission mask." Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
+
+    <!-- Web UI Port -->
+    <Config Name="WebUI Port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+
+    <!-- Authentication -->
+    <Config Name="Web Username" Target="WEB_USER" Default="admin" Mode="" Description="Username for web interface authentication. Required for security!" Type="Variable" Display="always" Required="true" Mask="false">admin</Config>
+    <Config Name="Web Password" Target="WEB_PASS" Default="" Mode="" Description="Password for web interface authentication. Required for security!" Type="Variable" Display="always" Required="true" Mask="true"></Config>
+
+    <!-- Reports Volume -->
+    <Config Name="Reports Directory" Target="/reports" Default="/mnt/user/appdata/media-audit/reports" Mode="rw" Description="Where audit reports are stored. Must be persistent." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/media-audit/reports</Config>
+
+    <!-- Media Volumes (READ ONLY!) -->
+    <Config Name="Plex Media" Target="/media/plexmedia" Default="/mnt/user/data/plexmedia" Mode="ro" Description="Your Plex media library. Mounted READ-ONLY for safety." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/data/plexmedia</Config>
+    <Config Name="Torrents Directory" Target="/media/torrents" Default="/mnt/user/data/torrents" Mode="ro" Description="Your torrents/downloads directory. Mounted READ-ONLY." Type="Path" Display="always" Required="false" Mask="false">/mnt/user/data/torrents</Config>
+
+    <!-- Media Settings -->
+    <Config Name="Media Roots" Target="ROOTS" Default="/media/plexmedia,/media/torrents" Mode="" Description="Comma-separated list of container paths to scan." Type="Variable" Display="always" Required="true" Mask="false">/media/plexmedia,/media/torrents</Config>
+    <Config Name="Delete Under" Target="DELETE_UNDER" Default="/media/plexmedia" Mode="" Description="Only suggest deletions under this path (container path)." Type="Variable" Display="always" Required="true" Mask="false">/media/plexmedia</Config>
+
+    <!-- qBittorrent Integration -->
+    <Config Name="qBittorrent Host" Target="QBIT_HOST" Default="" Mode="" Description="qBittorrent hostname or IP (leave empty to disable)." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+    <Config Name="qBittorrent Port" Target="QBIT_PORT" Default="8080" Mode="" Description="qBittorrent WebUI port." Type="Variable" Display="always" Required="false" Mask="false">8080</Config>
+    <Config Name="qBittorrent Username" Target="QBIT_USER" Default="" Mode="" Description="qBittorrent WebUI username." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+    <Config Name="qBittorrent Password" Target="QBIT_PASS" Default="" Mode="" Description="qBittorrent WebUI password." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+    <Config Name="qBittorrent Path Map" Target="QBIT_PATH_MAP" Default="" Mode="" Description="Path mapping from qBit container to host, e.g. /downloads:/mnt/user/data/torrents" Type="Variable" Display="always" Required="false" Mask="false"></Config>
+    <Config Name="qBittorrent WebUI URL" Target="QBIT_WEBUI_URL" Default="" Mode="" Description="Full URL to qBittorrent WebUI for links in reports." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+
+    <!-- Audit Settings -->
+    <Config Name="FFprobe Scope" Target="FFPROBE_SCOPE" Default="dupes" Mode="" Description="When to run ffprobe: none, dupes (recommended), or all." Type="Variable" Display="advanced" Required="false" Mask="false">dupes</Config>
+    <Config Name="Content Type" Target="CONTENT_TYPE" Default="auto" Mode="" Description="Force content type: auto (recommended), anime, series, or movie." Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
+    <Config Name="Avoid Mode" Target="AVOID_MODE" Default="if-no-prefer" Mode="" Description="Language avoidance mode: if-no-prefer, strict, or report-only." Type="Variable" Display="advanced" Required="false" Mask="false">if-no-prefer</Config>
+    <Config Name="Avoid Audio Languages" Target="AVOID_AUDIO_LANG" Default="" Mode="" Description="Comma-separated language codes to avoid (e.g., spa,fra)." Type="Variable" Display="advanced" Required="false" Mask="false"></Config>
+
+    <!-- Safety Settings -->
+    <Config Name="Allow Delete" Target="ALLOW_DELETE" Default="false" Mode="" Description="Enable deletion capability. KEEP FALSE unless you know what you're doing!" Type="Variable" Display="advanced" Required="false" Mask="false">false</Config>
+
+</Container>

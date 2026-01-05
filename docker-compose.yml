@@ -1,0 +1,108 @@
+# =============================================================================
+# Media Audit Docker Compose
+# For local development and testing
+# =============================================================================
+
+services:
+  media-audit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media-audit
+    hostname: media-audit
+    
+    # Run as non-root with Unraid-compatible PUID/PGID
+    environment:
+      # User/Group IDs (Unraid default: nobody=99, users=100)
+      - PUID=99
+      - PGID=100
+      - UMASK=022
+      
+      # Web UI Authentication (REQUIRED for security!)
+      - WEB_USER=${WEB_USER:-admin}
+      - WEB_PASS=${WEB_PASS:-changeme}
+      
+      # Report and media paths (container paths)
+      - REPORT_DIR=/reports
+      - ROOTS=/media/plexmedia,/media/torrents
+      - DELETE_UNDER=/media/plexmedia
+      
+      # qBittorrent Integration (optional)
+      # Uncomment and configure if you want torrent protection
+      # - QBIT_HOST=qbittorrent
+      # - QBIT_PORT=8080
+      # - QBIT_USER=admin
+      # - QBIT_PASS=adminadmin
+      # - QBIT_PATH_MAP=/downloads:/media/torrents
+      # - QBIT_WEBUI_URL=http://192.168.1.39:8081
+      
+      # Audit settings
+      - FFPROBE_SCOPE=dupes
+      - CONTENT_TYPE=auto
+      - AVOID_MODE=if-no-prefer
+      # - AVOID_AUDIO_LANG=spa,fra
+      
+      # Safety (keep false unless you know what you're doing)
+      - ALLOW_DELETE=false
+      
+      # Scheduling (disabled by default)
+      - SCHEDULE_ENABLED=false
+      # - SCHEDULE_CRON=0 3 * * *
+    
+    ports:
+      - "8080:8080"
+    
+    volumes:
+      # Reports directory - PERSISTENT (bind mount)
+      - ./data/reports:/reports
+      
+      # Media directories - READ ONLY by default for safety!
+      # On Unraid, these would be:
+      # - /mnt/user/data/plexmedia:/media/plexmedia:ro
+      # - /mnt/user/data/torrents:/media/torrents:ro
+      - ./data/media:/media:ro
+      
+      # Optional: config persistence
+      - ./data/config:/config
+    
+    restart: unless-stopped
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+# =============================================================================
+# Example: Full stack with qBittorrent
+# =============================================================================
+
+# Uncomment to add qBittorrent for testing
+#
+# services:
+#   qbittorrent:
+#     image: linuxserver/qbittorrent
+#     container_name: qbittorrent
+#     environment:
+#       - PUID=99
+#       - PGID=100
+#       - TZ=Europe/Zurich
+#       - WEBUI_PORT=8081
+#     volumes:
+#       - ./data/qbittorrent/config:/config
+#       - ./data/media/torrents:/downloads
+#     ports:
+#       - "8081:8081"
+#       - "6881:6881"
+#       - "6881:6881/udp"
+#     restart: unless-stopped
+
+# =============================================================================
+# Networks
+# =============================================================================
+
+networks:
+  default:
+    name: media-audit-net
