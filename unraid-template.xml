@@ -1,21 +1,27 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Container version="2">
-    <Name>media-audit</Name>
+    <n>media-audit</n>
     <Repository>ghcr.io/synmaki/unraid-media-audit:latest</Repository>
     <Registry>https://github.com/SynMaki/unraid-media-audit/pkgs/container/unraid-media-audit</Registry>
     <Network>bridge</Network>
     <Privileged>false</Privileged>
     <Support>https://github.com/SynMaki/unraid-media-audit/issues</Support>
     <Project>https://github.com/SynMaki/unraid-media-audit</Project>
-    <Overview>Media Audit scans your Plex/Sonarr media libraries to find duplicate episodes, compare quality, and generate delete scripts.&#xD;
+    <Overview>Media Audit v3.0 - Scan your Plex/Sonarr/Radarr media libraries to find duplicates, compare quality, and generate delete scripts.&#xD;
+&#xD;
+NEW IN v3.0: WebUI-based settings! Configure Sonarr, Radarr, and qBittorrent directly in the browser.&#xD;
 &#xD;
 Features:&#xD;
 - Finds duplicate episodes across multiple folders&#xD;
 - Quality scoring by resolution, codec, audio, and language&#xD;
 - Language preference: DEU+ENG for films, DEU+JPN for anime&#xD;
+- Sonarr/Radarr integration - protects managed files&#xD;
 - qBittorrent integration - protects seeding files&#xD;
+- WebUI settings page - easy configuration&#xD;
 - Interactive HTML reports with delete commands&#xD;
 - Safe by default - read-only scanning&#xD;
+&#xD;
+After install, go to Settings in the WebUI to configure Sonarr/Radarr/qBittorrent.&#xD;
 &#xD;
 IMPORTANT: Mount your media directories as READ-ONLY for safety!</Overview>
     <Category>Tools: MediaApp:Other</Category>
@@ -24,10 +30,7 @@ IMPORTANT: Mount your media directories as READ-ONLY for safety!</Overview>
     <Icon>https://raw.githubusercontent.com/SynMaki/unraid-media-audit/main/icon.png</Icon>
     <ExtraParams/>
     <PostArgs/>
-    <DonateText/>
-    <DonateLink/>
-    <DonateImg/>
-    <Beta>True</Beta>
+    <Beta>False</Beta>
     <Shell>bash</Shell>
     <Date>2025-01-05</Date>
 
@@ -35,6 +38,7 @@ IMPORTANT: Mount your media directories as READ-ONLY for safety!</Overview>
     <Config Name="WebUI Port" Target="8080" Default="8085" Mode="tcp" Description="Port for the web interface" Type="Port" Display="always" Required="true" Mask="false">8085</Config>
 
     <!-- Volumes -->
+    <Config Name="Config Directory" Target="/config" Default="/mnt/user/appdata/media-audit/config" Mode="rw" Description="Settings storage (persistent)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/media-audit/config</Config>
     <Config Name="Reports Directory" Target="/reports" Default="/mnt/user/appdata/media-audit/reports" Mode="rw" Description="Where audit reports are stored (persistent)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/media-audit/reports</Config>
     <Config Name="Plex Media" Target="/media/plexmedia" Default="/mnt/user/data/plexmedia" Mode="ro" Description="Your Plex media library (READ-ONLY for safety!)" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/data/plexmedia</Config>
     <Config Name="Torrents Directory" Target="/media/torrents" Default="/mnt/user/data/torrents" Mode="ro" Description="Your torrents/downloads directory (READ-ONLY)" Type="Path" Display="always" Required="false" Mask="false">/mnt/user/data/torrents</Config>
@@ -43,35 +47,12 @@ IMPORTANT: Mount your media directories as READ-ONLY for safety!</Overview>
     <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User ID (99 = nobody on Unraid)" Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
     <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group ID (100 = users on Unraid)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
 
-    <!-- Authentication -->
-    <Config Name="Web Username" Target="WEB_USER" Default="admin" Mode="" Description="Username for web interface login" Type="Variable" Display="always" Required="true" Mask="false">admin</Config>
-    <Config Name="Web Password" Target="WEB_PASS" Default="" Mode="" Description="Password for web interface login (REQUIRED!)" Type="Variable" Display="always" Required="true" Mask="true"/>
+    <!-- Optional: Initial Authentication (can also be set in WebUI) -->
+    <Config Name="Web Username" Target="WEB_USER" Default="" Mode="" Description="Optional: Initial username for web interface (can configure in WebUI Settings later)" Type="Variable" Display="advanced" Required="false" Mask="false"/>
+    <Config Name="Web Password" Target="WEB_PASS" Default="" Mode="" Description="Optional: Initial password for web interface (can configure in WebUI Settings later)" Type="Variable" Display="advanced" Required="false" Mask="true"/>
 
-    <!-- Media Settings -->
-    <Config Name="Media Roots" Target="ROOTS" Default="/media/plexmedia,/media/torrents" Mode="" Description="Paths to scan (container paths, comma-separated)" Type="Variable" Display="always" Required="true" Mask="false">/media/plexmedia,/media/torrents</Config>
-    <Config Name="Delete Under" Target="DELETE_UNDER" Default="/media/plexmedia" Mode="" Description="Only suggest deletions under this path" Type="Variable" Display="always" Required="true" Mask="false">/media/plexmedia</Config>
-
-    <!-- qBittorrent Integration -->
-    <Config Name="qBit Host" Target="QBIT_HOST" Default="" Mode="" Description="qBittorrent IP/hostname (leave empty to disable)" Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="qBit Port" Target="QBIT_PORT" Default="8080" Mode="" Description="qBittorrent WebUI port" Type="Variable" Display="always" Required="false" Mask="false">8080</Config>
-    <Config Name="qBit Username" Target="QBIT_USER" Default="" Mode="" Description="qBittorrent username" Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="qBit Password" Target="QBIT_PASS" Default="" Mode="" Description="qBittorrent password" Type="Variable" Display="always" Required="false" Mask="true"/>
-    <Config Name="qBit Path Map" Target="QBIT_PATH_MAP" Default="/data/torrents:/media/torrents" Mode="" Description="Path mapping: qBit-container-path:media-audit-path" Type="Variable" Display="always" Required="false" Mask="false">/data/torrents:/media/torrents</Config>
-    <Config Name="qBit WebUI URL" Target="QBIT_WEBUI_URL" Default="" Mode="" Description="Full URL for qBittorrent link in reports (e.g., http://192.168.1.39:8081)" Type="Variable" Display="always" Required="false" Mask="false"/>
-
-    <!-- Sonarr Integration -->
-    <Config Name="Sonarr URL" Target="SONARR_URL" Default="" Mode="" Description="Sonarr URL (e.g., http://192.168.1.39:8989) - leave empty to disable" Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="Sonarr API Key" Target="SONARR_APIKEY" Default="" Mode="" Description="Sonarr API Key (Settings > General)" Type="Variable" Display="always" Required="false" Mask="true"/>
-    <Config Name="Sonarr Path Map" Target="SONARR_PATH_MAP" Default="" Mode="" Description="Path mapping: sonarr-path:media-audit-path (e.g., /tv:/media/plexmedia/Serien)" Type="Variable" Display="always" Required="false" Mask="false"/>
-    
-    <!-- Radarr Integration -->
-    <Config Name="Radarr URL" Target="RADARR_URL" Default="" Mode="" Description="Radarr URL (e.g., http://192.168.1.39:7878) - leave empty to disable" Type="Variable" Display="always" Required="false" Mask="false"/>
-    <Config Name="Radarr API Key" Target="RADARR_APIKEY" Default="" Mode="" Description="Radarr API Key (Settings > General)" Type="Variable" Display="always" Required="false" Mask="true"/>
-    <Config Name="Radarr Path Map" Target="RADARR_PATH_MAP" Default="" Mode="" Description="Path mapping: radarr-path:media-audit-path (e.g., /movies:/media/plexmedia/Filme)" Type="Variable" Display="always" Required="false" Mask="false"/>
-
-    <!-- Audit Settings -->
-    <Config Name="FFprobe Scope" Target="FFPROBE_SCOPE" Default="dupes" Mode="" Description="When to analyze with ffprobe: none, dupes (recommended), or all" Type="Variable" Display="advanced" Required="false" Mask="false">dupes</Config>
-    <Config Name="Content Type" Target="CONTENT_TYPE" Default="auto" Mode="" Description="Force content type: auto (recommended), anime, series, or movie" Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
-    <Config Name="Avoid Mode" Target="AVOID_MODE" Default="if-no-prefer" Mode="" Description="Language avoidance: if-no-prefer, strict, or report-only" Type="Variable" Display="advanced" Required="false" Mask="false">if-no-prefer</Config>
+    <!-- Optional: Initial Media Settings (can also be set in WebUI) -->
+    <Config Name="Media Roots" Target="ROOTS" Default="/media/plexmedia,/media/torrents" Mode="" Description="Initial paths to scan (configure in WebUI Settings)" Type="Variable" Display="advanced" Required="false" Mask="false">/media/plexmedia,/media/torrents</Config>
+    <Config Name="Delete Under" Target="DELETE_UNDER" Default="/media/plexmedia" Mode="" Description="Only suggest deletions under this path" Type="Variable" Display="advanced" Required="false" Mask="false">/media/plexmedia</Config>
 
 </Container>

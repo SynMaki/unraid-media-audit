@@ -8,9 +8,9 @@ FROM python:3.11-slim-bookworm
 # Labels for Unraid Community Applications
 LABEL maintainer="Media Audit Project" \
       org.opencontainers.image.title="Media Audit" \
-      org.opencontainers.image.description="Scan media libraries for duplicates with qBittorrent integration" \
-      org.opencontainers.image.version="1.0.0" \
-      org.opencontainers.image.source="https://github.com/your-repo/media-audit"
+      org.opencontainers.image.description="Scan media libraries for duplicates with Sonarr/Radarr/qBittorrent integration" \
+      org.opencontainers.image.version="3.0.0" \
+      org.opencontainers.image.source="https://github.com/SynMaki/unraid-media-audit"
 
 # =============================================================================
 # Install system dependencies
@@ -65,7 +65,8 @@ RUN chmod +x /entrypoint.sh && \
 
 # Web server settings
 ENV HOST=0.0.0.0 \
-    PORT=8080
+    PORT=8080 \
+    CONFIG_DIR=/config
 
 # Authentication (empty = no auth required, for local network use)
 ENV WEB_USER="" \
