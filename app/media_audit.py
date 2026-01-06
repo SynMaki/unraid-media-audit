@@ -147,10 +147,18 @@ CFG = Config()
 # =============================================================================
 
 class QBittorrentClient:
-    """Simple qBittorrent WebUI API client using only stdlib."""
+    """Simple qBittorrent WebUI API client using only stdlib.
+    
+    API Reference: https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)
+    
+    IMPORTANT: qBittorrent requires Referer/Origin headers matching the host to prevent CSRF.
+    """
     
     def __init__(self, host: str, port: int, username: str = "", password: str = ""):
+        self.host = host
+        self.port = port
         self.base_url = f"http://{host}:{port}/api/v2"
+        self.origin_url = f"http://{host}:{port}"
         self.username = username
         self.password = password
         self.cookie_jar = http.cookiejar.CookieJar()
@@ -160,7 +168,7 @@ class QBittorrentClient:
         self._logged_in = False
     
     def _request(self, endpoint: str, data: Optional[dict] = None) -> Optional[bytes]:
-        """Make API request."""
+        """Make API request with proper headers for CSRF protection."""
         url = f"{self.base_url}/{endpoint}"
         try:
             if data:
@@ -169,10 +177,14 @@ class QBittorrentClient:
             else:
                 req = urllib.request.Request(url)
             
-            with self.opener.open(req, timeout=10) as response:
+            # CRITICAL: qBittorrent requires these headers to prevent CSRF
+            req.add_header("Referer", self.origin_url)
+            req.add_header("Origin", self.origin_url)
+            
+            with self.opener.open(req, timeout=15) as response:
                 return response.read()
         except urllib.error.HTTPError as e:
-            LOG.debug(f"qBittorrent HTTP error {e.code}: {e.reason}")
+            LOG.warning(f"qBittorrent HTTP error {e.code}: {e.reason} for {endpoint}")
             return None
         except urllib.error.URLError as e:
             LOG.warning(f"qBittorrent connection failed: {e.reason}")
@@ -2509,45 +2521,49 @@ def main() -> int:
         try:
             from servarr_client import (
                 ServarrManager, ServarrInstance, ServarrType,
-                parse_instances_from_env, parse_instances_from_cli,
-                load_instances_from_json_file
+                parse_instances_from_env, parse_instance_from_cli_arg,
             )
             
             servarr_manager = ServarrManager()
-            instance_configs = []
             
             # Load from environment variables
-            env_instances = parse_instances_from_env()
-            instance_configs.extend(env_instances)
+            sonarr_instances = parse_instances_from_env(ServarrType.SONARR)
+            radarr_instances = parse_instances_from_env(ServarrType.RADARR)
+            
+            for inst in sonarr_instances:
+                if servarr_manager.add_instance(inst):
+                    LOG.info(f"Connected to Sonarr instance: {inst.name} ({inst.url})")
+                else:
+                    LOG.warning(f"Failed to connect to Sonarr: {inst.name} - {inst.last_error}")
+            
+            for inst in radarr_instances:
+                if servarr_manager.add_instance(inst):
+                    LOG.info(f"Connected to Radarr instance: {inst.name} ({inst.url})")
+                else:
+                    LOG.warning(f"Failed to connect to Radarr: {inst.name} - {inst.last_error}")
             
             # Load from CLI arguments
-            cli_instances = parse_instances_from_cli(args.sonarr, args.radarr)
-            instance_configs.extend(cli_instances)
+            for sonarr_arg in args.sonarr:
+                inst = parse_instance_from_cli_arg(sonarr_arg, ServarrType.SONARR)
+                if inst:
+                    if servarr_manager.add_instance(inst):
+                        LOG.info(f"Connected to Sonarr (CLI): {inst.name}")
+                    else:
+                        LOG.warning(f"Failed to connect to Sonarr (CLI): {inst.name}")
             
-            # Load from JSON config files
-            if args.sonarr_config and os.path.exists(args.sonarr_config):
-                file_instances = load_instances_from_json_file(args.sonarr_config)
-                for inst in file_instances:
-                    inst["type"] = "sonarr"
-                    instance_configs.append(inst)
-            
-            if args.radarr_config and os.path.exists(args.radarr_config):
-                file_instances = load_instances_from_json_file(args.radarr_config)
-                for inst in file_instances:
-                    inst["type"] = "radarr"
-                    instance_configs.append(inst)
-            
-            # Add instances
-            for cfg in instance_configs:
-                if servarr_manager.add_instance_from_config(cfg):
-                    LOG.info(f"Connected to {cfg.get('type', 'unknown')} instance: {cfg.get('name', 'unnamed')}")
-                else:
-                    LOG.warning(f"Failed to connect to {cfg.get('type', 'unknown')} instance: {cfg.get('name', 'unnamed')}")
+            for radarr_arg in args.radarr:
+                inst = parse_instance_from_cli_arg(radarr_arg, ServarrType.RADARR)
+                if inst:
+                    if servarr_manager.add_instance(inst):
+                        LOG.info(f"Connected to Radarr (CLI): {inst.name}")
+                    else:
+                        LOG.warning(f"Failed to connect to Radarr (CLI): {inst.name}")
             
             # Load all managed files
             if servarr_manager.instances:
                 LOG.info("Loading managed files from Sonarr/Radarr instances...")
-                servarr_manager.load_all_files()
+                managed_count = servarr_manager.load_all_files()
+                LOG.info(f"Total managed files loaded: {managed_count}")
                 
                 # Match scanned media to Servarr managed files
                 for m in media:
@@ -2575,16 +2591,20 @@ def main() -> int:
                         m.arr_in_queue = True
                 
                 LOG.info(f"Matched {arr_protected_count} files to Sonarr/Radarr managed files")
-                LOG.info(f"Files in download queue: {len(servarr_manager.queue_paths)}")
+                LOG.info(f"Files in download queue: {len(servarr_manager.queue_evidence)}")
             else:
                 LOG.info("No Sonarr/Radarr instances configured")
                 servarr_manager = None
         
         except ImportError as e:
             LOG.warning(f"Servarr integration not available: {e}")
+            import traceback
+            traceback.print_exc()
             servarr_manager = None
         except Exception as e:
             LOG.warning(f"Servarr integration error: {e}")
+            import traceback
+            traceback.print_exc()
             servarr_manager = None
 
     # Group episodes

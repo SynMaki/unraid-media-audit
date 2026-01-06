@@ -196,7 +196,12 @@ class JobManager:
                     if sp and lp: parts.append(f"path_map={sp}:{lp}")
                 cmd.extend(["--radarr", ",".join(parts)])
         
-        if not sonarr_instances and not radarr_instances:
+        has_sonarr = any(inst.get("enabled") and inst.get("url") and inst.get("api_key") 
+                         for inst in sonarr_instances)
+        has_radarr = any(inst.get("enabled") and inst.get("url") and inst.get("api_key") 
+                         for inst in radarr_instances)
+        
+        if not has_sonarr and not has_radarr:
             cmd.append("--no-servarr")
         
         cmd.append("--html-report")

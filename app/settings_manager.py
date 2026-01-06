@@ -1,40 +1,81 @@
 #!/usr/bin/env python3
 """
-Settings Manager for Media Audit
+settings_manager.py — WebUI Settings Manager for Media Audit v3.2.0
 
-Handles persistent configuration storage and retrieval.
-Settings are stored in a JSON file and can be edited via the WebUI.
+Handles JSON-based configuration with:
+- Proper qBittorrent authentication (login + CSRF)
+- Sonarr/Radarr connection testing with root folder discovery
+- File-based logging to /config/logs/
+- Environment variable migration on first run
+
+qBittorrent API Reference:
+- https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)
+- Login: POST /api/v2/auth/login with username/password form data
+- Requires Referer header matching the host
 """
+
+from __future__ import annotations
 
 import json
 import logging
 import os
 import re
-import threading
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+import ssl
+import urllib.request
+import urllib.error
+import urllib.parse
+import http.cookiejar
 from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from threading import RLock
+from typing import Any, Dict, List, Optional
 
-LOG = logging.getLogger("settings_manager")
+
+def setup_logging(config_dir: str) -> logging.Logger:
+    """Setup file + console logging."""
+    log_dir = Path(config_dir) / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    log_file = log_dir / f"media_audit_{datetime.now().strftime('%Y%m%d')}.log"
+    
+    # Create logger
+    logger = logging.getLogger("media_audit")
+    logger.setLevel(logging.DEBUG)
+    
+    # Clear existing handlers
+    logger.handlers = []
+    
+    # File handler (detailed)
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(fh)
+    
+    # Console handler (info+)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(ch)
+    
+    return logger
 
 
-# =============================================================================
-# DEFAULT CONFIGURATION
-# =============================================================================
+LOG = logging.getLogger("media_audit.settings")
+
 
 DEFAULT_SETTINGS = {
     "general": {
         "report_dir": "/reports",
         "roots": ["/media"],
         "delete_under": "/media",
-        "ffprobe_scope": "dupes",  # none, dupes, all
-        "content_type": "auto",    # auto, anime, series, movie
-        "avoid_mode": "if-no-prefer",  # if-no-prefer, strict, report-only
+        "ffprobe_scope": "dupes",
+        "content_type": "auto",
+        "avoid_mode": "if-no-prefer",
         "avoid_audio_lang": [],
-        "allow_delete": False,
-        "schedule_enabled": False,
-        "schedule_cron": "0 3 * * *",
     },
     "qbittorrent": {
         "enabled": False,
@@ -42,19 +83,12 @@ DEFAULT_SETTINGS = {
         "port": 8080,
         "username": "",
         "password": "",
-        "path_mappings": [],  # List of {"qbit_path": "/downloads", "local_path": "/media/torrents"}
+        "path_mappings": [],
         "webui_url": "",
+        "tag_duplicates": False,
     },
     "sonarr_instances": [],
-    # Each instance: {
-    #     "enabled": True,
-    #     "name": "main",
-    #     "url": "http://sonarr:8989",
-    #     "api_key": "xxx",
-    #     "path_mappings": [{"servarr_path": "/tv", "local_path": "/media/Serien"}],
-    # }
     "radarr_instances": [],
-    # Same structure as sonarr_instances
     "web": {
         "auth_enabled": False,
         "username": "",
@@ -63,63 +97,268 @@ DEFAULT_SETTINGS = {
 }
 
 
-# =============================================================================
-# SETTINGS MANAGER CLASS
-# =============================================================================
+class QBittorrentClient:
+    """qBittorrent API client with proper authentication."""
+    
+    def __init__(self, host: str, port: int, username: str = "", password: str = ""):
+        self.base_url = f"http://{host}:{port}"
+        self.username = username
+        self.password = password
+        self._sid: Optional[str] = None
+        
+        # Setup cookie jar and opener
+        self._cookie_jar = http.cookiejar.CookieJar()
+        self._opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self._cookie_jar)
+        )
+    
+    def _request(self, endpoint: str, method: str = "GET", 
+                 data: Optional[Dict] = None, timeout: int = 10) -> Optional[str]:
+        """Make authenticated request to qBittorrent."""
+        url = f"{self.base_url}{endpoint}"
+        
+        headers = {
+            "Referer": self.base_url,
+            "Origin": self.base_url,
+        }
+        
+        try:
+            if data:
+                encoded = urllib.parse.urlencode(data).encode("utf-8")
+                req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
+            else:
+                req = urllib.request.Request(url, headers=headers, method=method)
+            
+            with self._opener.open(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8")
+                
+        except urllib.error.HTTPError as e:
+            LOG.error(f"qBittorrent HTTP {e.code}: {e.reason} for {endpoint}")
+            raise
+        except Exception as e:
+            LOG.error(f"qBittorrent request failed: {e}")
+            raise
+    
+    def login(self) -> bool:
+        """Authenticate with qBittorrent. Returns True on success."""
+        try:
+            result = self._request("/api/v2/auth/login", data={
+                "username": self.username,
+                "password": self.password,
+            })
+            
+            if result and result.strip().lower() == "ok.":
+                # Extract SID from cookies
+                for cookie in self._cookie_jar:
+                    if cookie.name == "SID":
+                        self._sid = cookie.value
+                        break
+                LOG.info(f"qBittorrent login successful")
+                return True
+            else:
+                LOG.error(f"qBittorrent login failed: {result}")
+                return False
+                
+        except urllib.error.HTTPError as e:
+            if e.code == 403:
+                LOG.error("qBittorrent login forbidden - check credentials and WebUI settings")
+            raise
+    
+    def get_version(self) -> str:
+        """Get qBittorrent version."""
+        return self._request("/api/v2/app/version") or "unknown"
+    
+    def get_torrents(self) -> List[Dict]:
+        """Get all torrents."""
+        result = self._request("/api/v2/torrents/info")
+        if result:
+            return json.loads(result)
+        return []
+    
+    def test_connection(self) -> Dict[str, Any]:
+        """Test connection and return status."""
+        try:
+            # First try without auth (some setups don't require it)
+            try:
+                version = self._request("/api/v2/app/version", timeout=5)
+                if version:
+                    return {
+                        "success": True,
+                        "message": "Connected (no auth required)",
+                        "details": {"version": version.strip()}
+                    }
+            except urllib.error.HTTPError as e:
+                if e.code != 403:
+                    raise
+                # 403 means we need to login
+            
+            # Try with authentication
+            if not self.username:
+                return {
+                    "success": False,
+                    "message": "Authentication required - please provide username/password"
+                }
+            
+            if self.login():
+                version = self.get_version()
+                torrents = self.get_torrents()
+                return {
+                    "success": True,
+                    "message": f"Connected with {len(torrents)} torrents",
+                    "details": {
+                        "version": version.strip(),
+                        "torrent_count": len(torrents),
+                    }
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": "Login failed - check username/password"
+                }
+                
+        except urllib.error.HTTPError as e:
+            return {
+                "success": False,
+                "message": f"HTTP Error: {e.code} {e.reason}"
+            }
+        except urllib.error.URLError as e:
+            return {
+                "success": False,
+                "message": f"Connection failed: {e.reason}"
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Error: {str(e)}"
+            }
+
+
+class ServarrTestClient:
+    """Test client for Sonarr/Radarr."""
+    
+    def __init__(self, url: str, api_key: str):
+        self.url = url.rstrip("/")
+        self.api_key = api_key
+        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
+    
+    def _request(self, endpoint: str) -> Optional[Any]:
+        """Make API request."""
+        url = f"{self.url}/api/v3/{endpoint}"
+        req = urllib.request.Request(url)
+        req.add_header("X-Api-Key", self.api_key)
+        req.add_header("Accept", "application/json")
+        
+        ctx = self._ssl_ctx if self.url.startswith("https") else None
+        
+        try:
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            LOG.error(f"Servarr request failed: {e}")
+            raise
+    
+    def test_connection(self, app_type: str) -> Dict[str, Any]:
+        """Test connection and get root folders."""
+        try:
+            # Get system status
+            status = self._request("system/status")
+            version = status.get("version", "unknown")
+            
+            # Get root folders for path suggestions
+            root_folders = self._request("rootfolder")
+            roots = [rf.get("path", "") for rf in root_folders if rf.get("path")]
+            
+            # Get series/movie count
+            if app_type == "sonarr":
+                items = self._request("series")
+                item_type = "series"
+            else:
+                items = self._request("movie")
+                item_type = "movies"
+            
+            return {
+                "success": True,
+                "message": f"Connected - {len(items)} {item_type}",
+                "details": {
+                    "version": version,
+                    "root_folders": roots,
+                    f"{item_type}_count": len(items),
+                }
+            }
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return {"success": False, "message": "Invalid API key"}
+            return {"success": False, "message": f"HTTP {e.code}: {e.reason}"}
+        except urllib.error.URLError as e:
+            return {"success": False, "message": f"Connection failed: {e.reason}"}
+        except Exception as e:
+            return {"success": False, "message": f"Error: {str(e)}"}
+
 
 class SettingsManager:
-    """
-    Manages application settings with file persistence.
-    
-    Settings are loaded from a JSON file and can be updated via the WebUI.
-    Changes are automatically persisted to disk.
-    """
+    """Thread-safe settings management with JSON persistence."""
     
     def __init__(self, config_dir: str = "/config"):
         self.config_dir = Path(config_dir)
-        self.config_file = self.config_dir / "settings.json"
-        self._lock = threading.RLock()
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.settings_file = self.config_dir / "settings.json"
+        self._lock = RLock()
         self._settings: Dict[str, Any] = {}
-        self._load_settings()
+        self._load()
     
-    def _load_settings(self) -> None:
-        """Load settings from file or initialize with defaults."""
+    def _load(self):
+        """Load settings from file or create defaults."""
         with self._lock:
-            # Start with defaults
-            self._settings = deepcopy(DEFAULT_SETTINGS)
-            
-            # Try to load from file
-            if self.config_file.exists():
+            if self.settings_file.exists():
                 try:
-                    with open(self.config_file, "r", encoding="utf-8") as f:
-                        saved = json.load(f)
-                    
-                    # Deep merge saved settings into defaults
-                    self._deep_merge(self._settings, saved)
-                    LOG.info(f"Settings loaded from {self.config_file}")
+                    with open(self.settings_file, "r", encoding="utf-8") as f:
+                        self._settings = json.load(f)
+                    LOG.info(f"Loaded settings from {self.settings_file}")
+                    self._migrate_if_needed()
                 except Exception as e:
                     LOG.error(f"Failed to load settings: {e}")
+                    self._settings = deepcopy(DEFAULT_SETTINGS)
             else:
-                # First run - check environment variables for initial config
-                self._load_from_environment()
-                self._save_settings()
-                LOG.info("Initialized settings with defaults")
+                LOG.info("No settings file found, creating from environment/defaults")
+                self._settings = deepcopy(DEFAULT_SETTINGS)
+                self._import_from_env()
+                self._save()
     
-    def _deep_merge(self, base: dict, override: dict) -> None:
-        """Deep merge override into base dict (modifies base in-place)."""
-        for key, value in override.items():
-            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-                self._deep_merge(base[key], value)
-            else:
-                base[key] = value
+    def _save(self) -> bool:
+        """Save settings to file."""
+        try:
+            with open(self.settings_file, "w", encoding="utf-8") as f:
+                json.dump(self._settings, f, indent=2, ensure_ascii=False)
+            LOG.debug("Settings saved")
+            return True
+        except Exception as e:
+            LOG.error(f"Failed to save settings: {e}")
+            return False
     
-    def _load_from_environment(self) -> None:
-        """Load initial settings from environment variables."""
-        g = self._settings["general"]
-        q = self._settings["qbittorrent"]
-        w = self._settings["web"]
+    def _migrate_if_needed(self):
+        """Ensure all default keys exist."""
+        changed = False
+        for section, defaults in DEFAULT_SETTINGS.items():
+            if section not in self._settings:
+                self._settings[section] = deepcopy(defaults)
+                changed = True
+            elif isinstance(defaults, dict):
+                for key, value in defaults.items():
+                    if key not in self._settings[section]:
+                        self._settings[section][key] = deepcopy(value)
+                        changed = True
+        if changed:
+            self._save()
+    
+    def _import_from_env(self):
+        """Import settings from environment variables."""
+        LOG.info("Importing settings from environment variables")
         
-        # General settings
+        # General
+        g = self._settings["general"]
         if os.environ.get("REPORT_DIR"):
             g["report_dir"] = os.environ["REPORT_DIR"]
         if os.environ.get("ROOTS"):
@@ -130,243 +369,136 @@ class SettingsManager:
             g["ffprobe_scope"] = os.environ["FFPROBE_SCOPE"]
         if os.environ.get("CONTENT_TYPE"):
             g["content_type"] = os.environ["CONTENT_TYPE"]
-        if os.environ.get("AVOID_MODE"):
-            g["avoid_mode"] = os.environ["AVOID_MODE"]
-        if os.environ.get("AVOID_AUDIO_LANG"):
-            g["avoid_audio_lang"] = [l.strip() for l in os.environ["AVOID_AUDIO_LANG"].split(",") if l.strip()]
-        if os.environ.get("ALLOW_DELETE", "").lower() == "true":
-            g["allow_delete"] = True
-        if os.environ.get("SCHEDULE_ENABLED", "").lower() == "true":
-            g["schedule_enabled"] = True
-        if os.environ.get("SCHEDULE_CRON"):
-            g["schedule_cron"] = os.environ["SCHEDULE_CRON"]
         
-        # qBittorrent settings
+        # qBittorrent
+        qb = self._settings["qbittorrent"]
         if os.environ.get("QBIT_HOST"):
-            q["enabled"] = True
-            q["host"] = os.environ["QBIT_HOST"]
-            q["port"] = int(os.environ.get("QBIT_PORT", "8080"))
-            q["username"] = os.environ.get("QBIT_USER", "")
-            q["password"] = os.environ.get("QBIT_PASS", "")
-            q["webui_url"] = os.environ.get("QBIT_WEBUI_URL", "")
+            qb["enabled"] = True
+            qb["host"] = os.environ["QBIT_HOST"]
+            qb["port"] = int(os.environ.get("QBIT_PORT", "8080"))
+            qb["username"] = os.environ.get("QBIT_USER", "")
+            qb["password"] = os.environ.get("QBIT_PASS", "")
             
             if os.environ.get("QBIT_PATH_MAP"):
                 for mapping in os.environ["QBIT_PATH_MAP"].split(";"):
-                    mapping = mapping.strip()
                     if ":" in mapping:
-                        parts = mapping.split(":", 1)
-                        q["path_mappings"].append({
-                            "qbit_path": parts[0],
-                            "local_path": parts[1]
-                        })
+                        qp, lp = mapping.split(":", 1)
+                        qb["path_mappings"].append({"qbit_path": qp, "local_path": lp})
         
-        # Web auth
-        if os.environ.get("WEB_USER") and os.environ.get("WEB_PASS"):
-            w["auth_enabled"] = True
-            w["username"] = os.environ["WEB_USER"]
-            w["password"] = os.environ["WEB_PASS"]
-        
-        # Sonarr instances from environment
-        self._load_servarr_from_env("sonarr")
-        self._load_servarr_from_env("radarr")
-    
-    def _load_servarr_from_env(self, app_type: str) -> None:
-        """Load Sonarr/Radarr instances from environment variables."""
-        prefix = app_type.upper()
-        instances_key = f"{app_type}_instances"
-        
-        # Check for JSON config
-        json_var = f"{prefix}_INSTANCES_JSON"
-        if os.environ.get(json_var):
-            try:
-                instances = json.loads(os.environ[json_var])
-                for inst in instances:
-                    self._settings[instances_key].append({
-                        "enabled": inst.get("enabled", True),
-                        "name": inst.get("name", app_type),
-                        "url": inst.get("url", ""),
-                        "api_key": inst.get("api_key", ""),
-                        "path_mappings": self._parse_path_mappings(inst.get("path_mappings", [])),
-                    })
-                return
-            except Exception as e:
-                LOG.error(f"Failed to parse {json_var}: {e}")
-        
-        # Check for single instance config
-        url = os.environ.get(f"{prefix}_URL")
-        apikey = os.environ.get(f"{prefix}_APIKEY")
-        if url and apikey:
-            path_mappings = []
-            if os.environ.get(f"{prefix}_PATH_MAP"):
-                for mapping in os.environ[f"{prefix}_PATH_MAP"].split(";"):
-                    mapping = mapping.strip()
-                    if ":" in mapping:
-                        parts = mapping.split(":", 1)
-                        path_mappings.append({
-                            "servarr_path": parts[0],
-                            "local_path": parts[1]
-                        })
-            
-            self._settings[instances_key].append({
+        # Sonarr
+        if os.environ.get("SONARR_URL") and os.environ.get("SONARR_APIKEY"):
+            self._settings["sonarr_instances"].append({
                 "enabled": True,
-                "name": os.environ.get(f"{prefix}_NAME", app_type.lower()),
-                "url": url,
-                "api_key": apikey,
-                "path_mappings": path_mappings,
+                "name": os.environ.get("SONARR_NAME", "sonarr"),
+                "url": os.environ["SONARR_URL"],
+                "api_key": os.environ["SONARR_APIKEY"],
+                "webui_url": os.environ.get("SONARR_WEBUI_URL", ""),
+                "path_mappings": [],
             })
         
-        # Check for numbered instances (SONARR_1_URL, SONARR_2_URL, etc.)
-        for i in range(1, 11):  # Support up to 10 instances
-            url = os.environ.get(f"{prefix}_{i}_URL")
-            apikey = os.environ.get(f"{prefix}_{i}_APIKEY")
-            if url and apikey:
-                path_mappings = []
-                if os.environ.get(f"{prefix}_{i}_PATH_MAP"):
-                    for mapping in os.environ[f"{prefix}_{i}_PATH_MAP"].split(";"):
-                        mapping = mapping.strip()
-                        if ":" in mapping:
-                            parts = mapping.split(":", 1)
-                            path_mappings.append({
-                                "servarr_path": parts[0],
-                                "local_path": parts[1]
-                            })
-                
-                self._settings[instances_key].append({
-                    "enabled": True,
-                    "name": os.environ.get(f"{prefix}_{i}_NAME", f"{app_type.lower()}-{i}"),
-                    "url": url,
-                    "api_key": apikey,
-                    "path_mappings": path_mappings,
-                })
-    
-    def _parse_path_mappings(self, mappings: list) -> list:
-        """Parse path mappings from various formats."""
-        result = []
-        for m in mappings:
-            if isinstance(m, dict):
-                result.append(m)
-            elif isinstance(m, str) and ":" in m:
-                parts = m.split(":", 1)
-                result.append({"servarr_path": parts[0], "local_path": parts[1]})
-        return result
-    
-    def _save_settings(self) -> None:
-        """Save settings to file."""
-        with self._lock:
-            try:
-                self.config_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Create a copy without sensitive data exposed in logs
-                with open(self.config_file, "w", encoding="utf-8") as f:
-                    json.dump(self._settings, f, indent=2)
-                
-                LOG.info(f"Settings saved to {self.config_file}")
-            except Exception as e:
-                LOG.error(f"Failed to save settings: {e}")
-    
-    # =========================================================================
-    # PUBLIC API
-    # =========================================================================
+        # Radarr
+        if os.environ.get("RADARR_URL") and os.environ.get("RADARR_APIKEY"):
+            self._settings["radarr_instances"].append({
+                "enabled": True,
+                "name": os.environ.get("RADARR_NAME", "radarr"),
+                "url": os.environ["RADARR_URL"],
+                "api_key": os.environ["RADARR_APIKEY"],
+                "webui_url": os.environ.get("RADARR_WEBUI_URL", ""),
+                "path_mappings": [],
+            })
+        
+        # Web auth
+        if os.environ.get("AUTH_USER") and os.environ.get("AUTH_PASS"):
+            self._settings["web"]["auth_enabled"] = True
+            self._settings["web"]["username"] = os.environ["AUTH_USER"]
+            self._settings["web"]["password"] = os.environ["AUTH_PASS"]
     
     def get_all(self) -> Dict[str, Any]:
-        """Get all settings (with API keys masked for display)."""
+        """Get all settings with masked sensitive data."""
         with self._lock:
             result = deepcopy(self._settings)
-            # Mask sensitive values for API response
-            self._mask_sensitive(result)
+            
+            # Mask qBittorrent password
+            if result.get("qbittorrent", {}).get("password"):
+                result["qbittorrent"]["password_masked"] = "********"
+            
+            # Mask Sonarr/Radarr API keys
+            for inst in result.get("sonarr_instances", []):
+                if inst.get("api_key"):
+                    k = inst["api_key"]
+                    inst["api_key_masked"] = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "****"
+            for inst in result.get("radarr_instances", []):
+                if inst.get("api_key"):
+                    k = inst["api_key"]
+                    inst["api_key_masked"] = f"{k[:4]}...{k[-4:]}" if len(k) > 8 else "****"
+            
+            # Mask web password
+            if result.get("web", {}).get("password"):
+                result["web"]["password_masked"] = "********"
+            
             return result
     
     def get_all_raw(self) -> Dict[str, Any]:
-        """Get all settings including sensitive values (for internal use)."""
+        """Get all settings including sensitive data (for internal use)."""
         with self._lock:
             return deepcopy(self._settings)
     
-    def _mask_sensitive(self, settings: dict) -> None:
-        """Mask sensitive values like passwords and API keys."""
-        # Mask qBittorrent password
-        if settings.get("qbittorrent", {}).get("password"):
-            settings["qbittorrent"]["password"] = "********"
-        
-        # Mask web password
-        if settings.get("web", {}).get("password"):
-            settings["web"]["password"] = "********"
-        
-        # Mask Sonarr API keys
-        for inst in settings.get("sonarr_instances", []):
-            if inst.get("api_key"):
-                inst["api_key"] = inst["api_key"][:4] + "****" + inst["api_key"][-4:] if len(inst["api_key"]) > 8 else "********"
-        
-        # Mask Radarr API keys
-        for inst in settings.get("radarr_instances", []):
-            if inst.get("api_key"):
-                inst["api_key"] = inst["api_key"][:4] + "****" + inst["api_key"][-4:] if len(inst["api_key"]) > 8 else "********"
-    
     def get(self, section: str, key: Optional[str] = None) -> Any:
-        """Get a specific setting value."""
-        with self._lock:
-            if key is None:
-                return deepcopy(self._settings.get(section, {}))
-            return deepcopy(self._settings.get(section, {}).get(key))
-    
-    def update(self, section: str, data: Dict[str, Any]) -> bool:
-        """Update settings for a section."""
+        """Get a setting or section."""
         with self._lock:
             if section not in self._settings:
-                LOG.error(f"Unknown settings section: {section}")
+                return None
+            if key is None:
+                return deepcopy(self._settings[section])
+            return deepcopy(self._settings[section].get(key))
+    
+    def update(self, section: str, data: Dict[str, Any]) -> bool:
+        """Update a settings section."""
+        with self._lock:
+            if section not in self._settings:
                 return False
             
-            # Handle special case for passwords - don't overwrite with masked values
-            if section == "qbittorrent" and data.get("password") == "********":
-                data["password"] = self._settings["qbittorrent"].get("password", "")
-            if section == "web" and data.get("password") == "********":
-                data["password"] = self._settings["web"].get("password", "")
-            
-            if isinstance(self._settings[section], list):
-                self._settings[section] = data
+            if isinstance(self._settings[section], dict):
+                for key, value in data.items():
+                    self._settings[section][key] = value
             else:
-                self._settings[section].update(data)
+                self._settings[section] = data
             
-            self._save_settings()
-            return True
+            LOG.info(f"Updated settings section: {section}")
+            return self._save()
     
     def add_instance(self, app_type: str, instance: Dict[str, Any]) -> bool:
-        """Add a new Sonarr/Radarr instance."""
+        """Add a Sonarr/Radarr instance."""
         with self._lock:
             key = f"{app_type}_instances"
             if key not in self._settings:
                 return False
             
             # Ensure required fields
-            if not instance.get("name") or not instance.get("url") or not instance.get("api_key"):
-                return False
-            
-            # Default enabled to True
-            if "enabled" not in instance:
-                instance["enabled"] = True
-            if "path_mappings" not in instance:
-                instance["path_mappings"] = []
+            instance.setdefault("enabled", True)
+            instance.setdefault("name", f"{app_type}-{len(self._settings[key]) + 1}")
+            instance.setdefault("path_mappings", [])
             
             self._settings[key].append(instance)
-            self._save_settings()
-            return True
+            LOG.info(f"Added {app_type} instance: {instance.get('name')}")
+            return self._save()
     
     def update_instance(self, app_type: str, index: int, instance: Dict[str, Any]) -> bool:
-        """Update an existing Sonarr/Radarr instance."""
+        """Update a Sonarr/Radarr instance."""
         with self._lock:
             key = f"{app_type}_instances"
             if key not in self._settings:
                 return False
-            
             if index < 0 or index >= len(self._settings[key]):
                 return False
             
-            # Handle masked API key
-            if instance.get("api_key", "").endswith("****"):
-                instance["api_key"] = self._settings[key][index].get("api_key", "")
+            # Preserve API key if not provided
+            if not instance.get("api_key") and self._settings[key][index].get("api_key"):
+                instance["api_key"] = self._settings[key][index]["api_key"]
             
             self._settings[key][index] = instance
-            self._save_settings()
-            return True
+            LOG.info(f"Updated {app_type} instance {index}: {instance.get('name')}")
+            return self._save()
     
     def remove_instance(self, app_type: str, index: int) -> bool:
         """Remove a Sonarr/Radarr instance."""
@@ -374,91 +506,53 @@ class SettingsManager:
             key = f"{app_type}_instances"
             if key not in self._settings:
                 return False
-            
             if index < 0 or index >= len(self._settings[key]):
                 return False
             
-            del self._settings[key][index]
-            self._save_settings()
-            return True
+            removed = self._settings[key].pop(index)
+            LOG.info(f"Removed {app_type} instance: {removed.get('name')}")
+            return self._save()
     
     def test_connection(self, app_type: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Test connection to a Sonarr/Radarr/qBittorrent instance."""
-        import urllib.request
-        import urllib.error
-        import ssl
+        """Test connection to qBittorrent/Sonarr/Radarr."""
+        LOG.info(f"Testing {app_type} connection")
         
-        result = {"success": False, "message": "", "details": {}}
-        
-        try:
-            if app_type in ("sonarr", "radarr"):
-                url = config.get("url", "").rstrip("/")
-                api_key = config.get("api_key", "")
-                
-                if not url or not api_key:
-                    result["message"] = "URL and API key are required"
-                    return result
-                
-                # Test /api/v3/system/status
-                test_url = f"{url}/api/v3/system/status"
-                req = urllib.request.Request(test_url)
-                req.add_header("X-Api-Key", api_key)
-                req.add_header("Accept", "application/json")
-                
-                ctx = ssl.create_default_context()
-                ctx.check_hostname = False
-                ctx.verify_mode = ssl.CERT_NONE
-                
-                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-                    data = json.loads(resp.read().decode())
-                    result["success"] = True
-                    result["message"] = f"Connected to {app_type.title()}"
-                    result["details"] = {
-                        "version": data.get("version", "unknown"),
-                        "appName": data.get("appName", app_type.title()),
-                    }
+        if app_type == "qbittorrent":
+            client = QBittorrentClient(
+                host=config.get("host", ""),
+                port=config.get("port", 8080),
+                username=config.get("username", ""),
+                password=config.get("password", ""),
+            )
+            result = client.test_connection()
             
-            elif app_type == "qbittorrent":
-                host = config.get("host", "")
-                port = config.get("port", 8080)
-                
-                if not host:
-                    result["message"] = "Host is required"
-                    return result
-                
-                # Test qBittorrent API
-                test_url = f"http://{host}:{port}/api/v2/app/version"
-                req = urllib.request.Request(test_url)
-                
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    version = resp.read().decode().strip()
-                    result["success"] = True
-                    result["message"] = "Connected to qBittorrent"
-                    result["details"] = {"version": version}
+        elif app_type in ("sonarr", "radarr"):
+            url = config.get("url", "")
+            api_key = config.get("api_key", "")
             
-            else:
-                result["message"] = f"Unknown app type: {app_type}"
+            if not url:
+                return {"success": False, "message": "URL is required"}
+            if not api_key:
+                return {"success": False, "message": "API key is required"}
+            
+            client = ServarrTestClient(url, api_key)
+            result = client.test_connection(app_type)
+        else:
+            return {"success": False, "message": f"Unknown app type: {app_type}"}
         
-        except urllib.error.HTTPError as e:
-            result["message"] = f"HTTP Error: {e.code} {e.reason}"
-        except urllib.error.URLError as e:
-            result["message"] = f"Connection failed: {e.reason}"
-        except Exception as e:
-            result["message"] = f"Error: {str(e)}"
-        
+        LOG.info(f"Test result for {app_type}: {result.get('message')}")
         return result
 
 
-# =============================================================================
-# GLOBAL INSTANCE
-# =============================================================================
-
-_settings_manager: Optional[SettingsManager] = None
+# Global instance
+_manager: Optional[SettingsManager] = None
 
 
 def get_settings_manager(config_dir: str = "/config") -> SettingsManager:
-    """Get or create the global settings manager instance."""
-    global _settings_manager
-    if _settings_manager is None:
-        _settings_manager = SettingsManager(config_dir)
-    return _settings_manager
+    """Get or create the global settings manager."""
+    global _manager
+    if _manager is None:
+        # Setup logging first
+        setup_logging(config_dir)
+        _manager = SettingsManager(config_dir)
+    return _manager

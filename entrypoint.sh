@@ -103,7 +103,11 @@ fi
 # =============================================================================
 
 mkdir -p "${REPORT_DIR:-/reports}" 2>/dev/null || true
+mkdir -p "${CONFIG_DIR:-/config}/logs" 2>/dev/null || true
 chown appuser:appgroup "${REPORT_DIR:-/reports}" 2>/dev/null || true
+chown -R appuser:appgroup "${CONFIG_DIR:-/config}" 2>/dev/null || true
+
+log "  Log directory: ${CONFIG_DIR:-/config}/logs"
 
 # =============================================================================
 # Sensitive data protection
