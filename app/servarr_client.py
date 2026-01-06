@@ -483,8 +483,13 @@ class ServarrClient:
         return files
     
     def _get_sonarr_files(self) -> Dict[str, ManagedFile]:
+        """Get all episode files from Sonarr."""
         files: Dict[str, ManagedFile] = {}
         series_list = self.get_all_series()
+        
+        LOG.info(f"[{self.instance.name}] Processing {len(series_list)} series from Sonarr")
+        episode_file_count = 0
+        skipped_root_folder = 0
         
         for series in series_list:
             series_id = series.get("id", 0)
@@ -493,16 +498,31 @@ class ServarrClient:
             qp = self.instance.quality_profiles.get(qp_id, QualityProfile(id=0, name="Unknown"))
             
             series_path = series.get("path", "")
+            
+            # Filter by root folders if configured
             if self.instance.root_folders:
                 if not any(series_path.startswith(rf) for rf in self.instance.root_folders):
+                    skipped_root_folder += 1
                     continue
             
-            for ef in self.get_episode_files(series_id):
+            episode_files = self.get_episode_files(series_id)
+            for ef in episode_files:
                 path = ef.get("path", "")
                 if not path:
                     continue
                 
+                episode_file_count += 1
+                
+                # Map Sonarr path to local path
                 local_path = self.instance.map_path_to_local(path)
+                
+                # Log first few path mappings for debugging
+                if episode_file_count <= 5:
+                    LOG.debug(f"[{self.instance.name}] Sonarr path: {path}")
+                    LOG.debug(f"[{self.instance.name}] Local path:  {local_path}")
+                    if path == local_path:
+                        LOG.debug(f"[{self.instance.name}] ⚠️ No path mapping applied!")
+                
                 quality_obj = ef.get("quality", {}).get("quality", {})
                 custom_formats = [cf.get("name", "") for cf in ef.get("customFormats", []) if cf.get("name")]
                 cutoff_not_met = ef.get("qualityCutoffNotMet", False)
@@ -527,6 +547,11 @@ class ServarrClient:
                     instance_name=self.instance.name, instance_type=self.instance.app_type.value,
                 )
                 files[local_path] = mf
+        
+        LOG.info(f"[{self.instance.name}] Loaded {len(files)} episode files from {len(series_list) - skipped_root_folder} series")
+        if skipped_root_folder > 0:
+            LOG.debug(f"[{self.instance.name}] Skipped {skipped_root_folder} series (not in root folders)")
+        
         return files
     
     def _get_radarr_files(self) -> Dict[str, ManagedFile]:
@@ -636,32 +661,52 @@ class ServarrManager:
             return False
     
     def load_all_files(self) -> int:
+        """Load all managed files and queue items from all connected instances."""
         self.managed_files.clear()
         self.queue_evidence.clear()
         
+        LOG.info(f"Loading files from {len(self.clients)} Sonarr/Radarr instances...")
+        
         for name, client in self.clients.items():
             instance = client.instance
+            LOG.info(f"[{name}] Processing {instance.app_type.value} instance: {instance.url}")
+            
             if instance.connection_status != ConnectionStatus.CONNECTED:
+                LOG.info(f"[{name}] Attempting connection...")
                 if not client.connect():
+                    LOG.warning(f"[{name}] Connection failed: {instance.last_error}")
                     continue
+                LOG.info(f"[{name}] Connected successfully")
             
             try:
+                LOG.info(f"[{name}] Loading managed files...")
                 files = client.get_all_managed_files()
+                LOG.info(f"[{name}] Found {len(files)} managed files")
+                
+                # Log first few paths for debugging
+                sample_paths = list(files.keys())[:3]
+                for p in sample_paths:
+                    LOG.debug(f"[{name}] Sample file: {p}")
+                
                 for path, mf in files.items():
                     self.managed_files[path] = (mf, instance)
                 self.instance_stats[name]["files_count"] = len(files)
             except Exception as e:
                 LOG.error(f"[{name}] Error loading files: {e}")
+                import traceback
+                LOG.debug(traceback.format_exc())
             
             try:
+                LOG.info(f"[{name}] Loading download queue...")
                 queue = client.get_queue_paths()
+                LOG.info(f"[{name}] Found {len(queue)} items in queue")
                 self.queue_evidence.update(queue)
                 self.instance_stats[name]["queue_count"] = len(queue)
             except Exception as e:
                 LOG.error(f"[{name}] Error loading queue: {e}")
         
         self.load_timestamp = datetime.now()
-        LOG.info(f"Total managed: {len(self.managed_files)}, Queue: {len(self.queue_evidence)}")
+        LOG.info(f"=== Servarr Summary: {len(self.managed_files)} total managed files, {len(self.queue_evidence)} in queue ===")
         return len(self.managed_files)
     
     def is_managed(self, path: str) -> bool:

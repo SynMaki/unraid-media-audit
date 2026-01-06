@@ -281,14 +281,51 @@ class QBittorrentClient:
         torrents = self.get_torrents()
         
         if not torrents:
+            LOG.warning("No torrents returned from qBittorrent")
             return {}, {}, {}
         
         path_mappings = path_mappings or {}
         inode_errors = 0
         inode_success = 0
         
+        # Count torrent states for debugging
+        state_counts = {}
+        for t in torrents:
+            s = t.get("state", "unknown")
+            state_counts[s] = state_counts.get(s, 0) + 1
+        
+        LOG.info(f"qBittorrent torrent states: {state_counts}")
+        
+        # Which states count as "seeding" / active?
+        # See: https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorrent-4.1)#torrent-management
+        SEEDING_STATES = {
+            "uploading",      # Currently uploading
+            "stalledUP",      # Seeding but no peers
+            "queuedUP",       # Queued for seeding
+            "forcedUP",       # Forced seeding
+            "seeding",        # Legacy state name
+        }
+        
+        # Also protect downloading torrents (incomplete)
+        DOWNLOADING_STATES = {
+            "downloading",
+            "stalledDL", 
+            "queuedDL",
+            "forcedDL",
+            "metaDL",
+            "allocating",
+            "checkingDL",
+        }
+        
+        ACTIVE_STATES = SEEDING_STATES | DOWNLOADING_STATES
+        
+        seeding_count = sum(1 for t in torrents if t.get("state") in SEEDING_STATES)
+        downloading_count = sum(1 for t in torrents if t.get("state") in DOWNLOADING_STATES)
+        LOG.info(f"Active torrents: {seeding_count} seeding, {downloading_count} downloading")
+        
         # Log first few paths for debugging
         first_paths_logged = 0
+        skipped_states = 0
         
         for torrent in torrents:
             torrent_hash = torrent.get("hash", "")
@@ -296,11 +333,17 @@ class QBittorrentClient:
             state = torrent.get("state", "")
             save_path = torrent.get("save_path", "").rstrip("/")
             
+            # Skip completed/paused torrents that aren't seeding
+            # NOTE: We process ALL states but mark the state in info for later filtering
+            is_active = state in ACTIVE_STATES
+            
             # Apply path mapping (container path -> host path)
             host_save_path = save_path
+            mapping_applied = False
             for container_path, host_path in path_mappings.items():
                 if save_path.startswith(container_path):
                     host_save_path = save_path.replace(container_path, host_path, 1)
+                    mapping_applied = True
                     break
             
             # Get files in this torrent
@@ -326,10 +369,12 @@ class QBittorrentClient:
                     "torrent_hash": torrent_hash,
                     "torrent_name": torrent_name,
                     "state": state,
+                    "is_active": is_active,
                     "save_path": host_save_path,
                     "torrent_file_name": file_name,
                     "torrent_path": abs_path,
                     "container_path": os.path.join(save_path, file_name),  # Original container path
+                    "mapping_applied": mapping_applied,
                 }
                 
                 path_map[abs_path] = info
@@ -339,8 +384,11 @@ class QBittorrentClient:
                 filename_map[basename] = info
                 
                 # Log first few paths for debugging
-                if first_paths_logged < 3:
-                    LOG.debug(f"Torrent path: container={os.path.join(save_path, file_name)} -> host={abs_path}")
+                if first_paths_logged < 5:
+                    LOG.debug(f"Torrent file: state={state} active={is_active}")
+                    LOG.debug(f"  container: {os.path.join(save_path, file_name)}")
+                    LOG.debug(f"  host:      {abs_path}")
+                    LOG.debug(f"  mapping:   {mapping_applied}")
                     first_paths_logged += 1
                 
                 # Get inode for hardlink matching
@@ -414,6 +462,39 @@ def normalize_lang_code(code: str) -> str:
 # LOGGING
 # =============================================================================
 
+def setup_logging(debug: bool = False, log_dir: str = "/config/logs") -> logging.Logger:
+    """Setup centralized logging to file AND console."""
+    from datetime import datetime
+    from pathlib import Path
+    
+    # Create log directory
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    log_file = Path(log_dir) / f"media_audit_{datetime.now().strftime('%Y%m%d')}.log"
+    
+    # Get root logger for media_audit
+    logger = logging.getLogger("media_audit")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.handlers = []  # Clear existing handlers
+    
+    # File handler - detailed logging
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    ))
+    logger.addHandler(fh)
+    
+    # Console handler - info level
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG if debug else logging.INFO)
+    ch.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(ch)
+    
+    logger.info(f"Logging initialized - file: {log_file}")
+    return logger
+
+# Initialize with basic config, will be reconfigured in main()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -2385,11 +2466,16 @@ def parse_args():
 
 
 def main() -> int:
+    global LOG
     args = parse_args()
-    if args.verbose:
-        LOG.setLevel(logging.DEBUG)
-
-    LOG.info(f"media_audit.py v{VERSION}")
+    
+    # Setup centralized logging (file + console)
+    log_dir = os.environ.get("CONFIG_DIR", "/config") + "/logs"
+    LOG = setup_logging(debug=args.verbose, log_dir=log_dir)
+    
+    LOG.info("=" * 60)
+    LOG.info(f"media_audit.py v{VERSION} - Starting audit")
+    LOG.info("=" * 60)
 
     ctype = ContentType(args.content_type)
     avoid_mode = AvoidMode(args.avoid_mode)
@@ -2487,26 +2573,36 @@ def main() -> int:
                         matched_by_inode += 1
                 
                 if torrent_info:
-                    # This file is directly in a torrent
-                    m.is_seeding = True
-                    m.torrent_hash = torrent_info.get("torrent_hash")
-                    m.torrent_name = torrent_info.get("torrent_name")
-                    m.torrent_file_name = torrent_info.get("torrent_file_name")
-                    seeding_count += 1
+                    # Only protect files from ACTIVE torrents (seeding or downloading)
+                    is_active = torrent_info.get("is_active", False)
+                    state = torrent_info.get("state", "unknown")
                     
-                    # Also mark all hardlinks to this file!
-                    inode_key = (m.dev, m.inode)
-                    if inode_key in media_by_inode:
-                        for linked in media_by_inode[inode_key]:
-                            if not linked.is_seeding:
-                                linked.is_seeding = True
-                                linked.torrent_hash = torrent_info.get("torrent_hash")
-                                linked.torrent_name = torrent_info.get("torrent_name")
-                                linked.torrent_file_name = torrent_info.get("torrent_file_name")
-                                matched_by_hardlink += 1
-                                seeding_count += 1
+                    if is_active:
+                        # This file is in an active torrent - protect it!
+                        m.is_seeding = True
+                        m.torrent_hash = torrent_info.get("torrent_hash")
+                        m.torrent_name = torrent_info.get("torrent_name")
+                        m.torrent_file_name = torrent_info.get("torrent_file_name")
+                        seeding_count += 1
+                        
+                        LOG.debug(f"Protected (active torrent {state}): {m.path}")
+                        
+                        # Also mark all hardlinks to this file!
+                        inode_key = (m.dev, m.inode)
+                        if inode_key in media_by_inode:
+                            for linked in media_by_inode[inode_key]:
+                                if not linked.is_seeding:
+                                    linked.is_seeding = True
+                                    linked.torrent_hash = torrent_info.get("torrent_hash")
+                                    linked.torrent_name = torrent_info.get("torrent_name")
+                                    linked.torrent_file_name = torrent_info.get("torrent_file_name")
+                                    matched_by_hardlink += 1
+                                    seeding_count += 1
+                                    LOG.debug(f"Protected (hardlink to active torrent): {linked.path}")
+                    else:
+                        LOG.debug(f"Matched but not protected (state={state}): {m.path}")
             
-            LOG.info(f"Matched {seeding_count} files to torrents (path:{matched_by_path}, inode:{matched_by_inode}, hardlink:{matched_by_hardlink})")
+            LOG.info(f"Matched {seeding_count} files to ACTIVE torrents (path:{matched_by_path}, inode:{matched_by_inode}, hardlink:{matched_by_hardlink})")
         else:
             LOG.warning("No torrent files found or qBittorrent connection failed")
 
