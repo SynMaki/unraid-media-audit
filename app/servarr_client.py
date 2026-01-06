@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
 """
-servarr_client.py — Sonarr/Radarr API Client for Media Audit
+servarr_client.py — Enhanced Sonarr/Radarr API Client for Media Audit
 
-Provides integration with Sonarr and Radarr instances:
+Provides robust integration with Sonarr and Radarr instances:
 - Fetch managed files (episodeFile, movieFile) with paths
-- Get quality profiles, custom formats, scores
-- Mark files as protected/managed
-- Path mapping between container and host paths
+- Queue monitoring for in-progress downloads
+- Protection with detailed evidence/reasoning
+- Graceful degradation on API failures
+- Caching to minimize API calls
 - Support for multiple instances
 
-Version: 1.0.0
+Version: 2.0.0
 
-API Reference:
-- Sonarr v3/v4: /api/v3/episodefile, /api/v3/series, /api/v3/qualityprofile
-- Radarr v3: /api/v3/moviefile, /api/v3/movie, /api/v3/qualityprofile
+API Reference Documentation:
+- Sonarr API v3/v4: https://sonarr.tv/docs/api/
+  - GET /api/v3/episodefile?seriesId={id} - Episode files for a series
+  - GET /api/v3/series - All series
+  - GET /api/v3/queue - Download queue
+  - GET /api/v3/qualityprofile - Quality profiles
+  - GET /api/v3/system/status - System status/version
+  
+- Radarr API v3: https://radarr.video/docs/api/
+  - GET /api/v3/moviefile?movieId={id} - Movie file
+  - GET /api/v3/movie - All movies
+  - GET /api/v3/queue - Download queue
+  - GET /api/v3/qualityprofile - Quality profiles
+  - GET /api/v3/system/status - System status/version
+
+- Python libraries: devopsarr/sonarr-py, devopsarr/radarr-py, pyarr
 """
 
 from __future__ import annotations
@@ -22,16 +36,23 @@ import json
 import logging
 import os
 import re
+import ssl
+import time
 import urllib.request
 import urllib.parse
 import urllib.error
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from datetime import datetime
 
 LOG = logging.getLogger("servarr_client")
 
+
+# =============================================================================
+# ENUMS AND CONSTANTS
+# =============================================================================
 
 class ServarrType(Enum):
     """Type of Servarr application."""
@@ -39,20 +60,40 @@ class ServarrType(Enum):
     RADARR = "radarr"
 
 
+class ProtectionReason(Enum):
+    """Why a file is protected from deletion."""
+    MANAGED_EPISODE = "managed_by_sonarr"
+    MANAGED_MOVIE = "managed_by_radarr"
+    IN_QUEUE = "in_download_queue"
+    SEEDING = "seeding_in_qbittorrent"
+    UNKNOWN = "protection_check_failed"
+
+
+class ConnectionStatus(Enum):
+    """Connection status for an instance."""
+    CONNECTED = "connected"
+    FAILED = "failed"
+    NOT_TESTED = "not_tested"
+    AUTH_ERROR = "auth_error"
+    TIMEOUT = "timeout"
+
+
+# =============================================================================
+# DATA CLASSES
+# =============================================================================
+
 @dataclass
 class PathMapping:
     """Maps paths between Servarr container and local host."""
-    servarr_path: str  # Path as seen by Sonarr/Radarr (container path)
-    local_path: str    # Path as seen by media_audit (host path)
+    servarr_path: str
+    local_path: str
     
     def to_local(self, path: str) -> str:
-        """Convert Servarr path to local path."""
         if path.startswith(self.servarr_path):
             return path.replace(self.servarr_path, self.local_path, 1)
         return path
     
     def to_servarr(self, path: str) -> str:
-        """Convert local path to Servarr path."""
         if path.startswith(self.local_path):
             return path.replace(self.local_path, self.servarr_path, 1)
         return path
@@ -82,33 +123,73 @@ class QualityProfile:
         )
 
 
+@dataclass
+class ProtectionEvidence:
+    """Detailed evidence for why a file is protected."""
+    reason: ProtectionReason
+    instance_name: str = ""
+    instance_type: str = ""
+    file_id: Optional[int] = None
+    media_id: Optional[int] = None
+    media_title: str = ""
+    quality: str = ""
+    quality_profile: str = ""
+    custom_formats: List[str] = field(default_factory=list)
+    custom_format_score: int = 0
+    webui_link: str = ""
+    queue_status: str = ""
+    queue_title: str = ""
+    torrent_name: str = ""
+    torrent_hash: str = ""
+    torrent_state: str = ""
+    torrent_ratio: float = 0.0
+    torrent_category: str = ""
+    torrent_tags: List[str] = field(default_factory=list)
+    qbit_webui_link: str = ""
+    error_message: str = ""
+    
+    def to_dict(self) -> dict:
+        return {k: (v.value if isinstance(v, Enum) else v) 
+                for k, v in asdict(self).items() 
+                if v and (not isinstance(v, list) or v)}
+    
+    def get_summary(self) -> str:
+        if self.reason == ProtectionReason.MANAGED_EPISODE:
+            return f"Sonarr/{self.instance_name}: {self.media_title} ({self.quality})"
+        elif self.reason == ProtectionReason.MANAGED_MOVIE:
+            return f"Radarr/{self.instance_name}: {self.media_title} ({self.quality})"
+        elif self.reason == ProtectionReason.IN_QUEUE:
+            return f"Queue/{self.instance_name}: {self.queue_title} ({self.queue_status})"
+        elif self.reason == ProtectionReason.SEEDING:
+            return f"qBit: {self.torrent_name} (ratio: {self.torrent_ratio:.2f})"
+        elif self.reason == ProtectionReason.UNKNOWN:
+            return f"Check failed: {self.error_message}"
+        return str(self.reason.value)
+
+
 @dataclass 
 class ManagedFile:
-    """A file managed by Sonarr/Radarr."""
+    """A file managed by Sonarr/Radarr with full metadata."""
     file_id: int
-    path: str                      # Path as reported by Servarr
-    local_path: str                # Path mapped to local filesystem
+    path: str
+    local_path: str
     size: int
-    quality: str                   # Quality name (e.g., "Bluray-1080p")
+    quality: str
     quality_id: int
     custom_format_score: int = 0
     custom_formats: List[str] = field(default_factory=list)
     quality_cutoff_not_met: bool = False
-    
-    # Media info
-    media_id: int = 0              # seriesId or movieId
-    media_title: str = ""          # Series/Movie title
-    season_number: Optional[int] = None  # For episodes
-    episode_number: Optional[int] = None # For episodes
-    
-    # Profile info
+    media_id: int = 0
+    media_title: str = ""
+    season_number: Optional[int] = None
+    episode_numbers: List[int] = field(default_factory=list)
     quality_profile_id: int = 0
     quality_profile_name: str = ""
     upgrade_recommended: bool = False
     upgrade_reason: str = ""
-    
-    # Link to WebUI
     webui_link: str = ""
+    instance_name: str = ""
+    instance_type: str = ""
 
 
 @dataclass
@@ -119,23 +200,28 @@ class ServarrInstance:
     api_key: str
     app_type: ServarrType
     path_mappings: List[PathMapping] = field(default_factory=list)
-    root_folders: List[str] = field(default_factory=list)  # Optional: filter by root
-    
-    # Runtime data (populated after connection)
+    root_folders: List[str] = field(default_factory=list)
+    webui_url: str = ""
+    enabled: bool = True
+    timeout: int = 30
+    retries: int = 2
     version: str = ""
     is_v4: bool = False
     quality_profiles: Dict[int, QualityProfile] = field(default_factory=dict)
+    connection_status: ConnectionStatus = ConnectionStatus.NOT_TESTED
+    last_error: str = ""
     
     def __post_init__(self):
-        # Normalize URL
         self.url = self.url.rstrip("/")
         if not self.url.startswith("http"):
             self.url = f"http://{self.url}"
+        if not self.webui_url:
+            self.webui_url = self.url
     
     @classmethod
-    def from_dict(cls, data: dict) -> "ServarrInstance":
-        """Create instance from dictionary config."""
-        app_type = ServarrType(data.get("type", "sonarr").lower())
+    def from_dict(cls, data: dict, app_type: Optional[ServarrType] = None) -> "ServarrInstance":
+        if app_type is None:
+            app_type = ServarrType(data.get("type", data.get("app_type", "sonarr")).lower())
         
         path_mappings = []
         for pm in data.get("path_mappings", []):
@@ -155,10 +241,13 @@ class ServarrInstance:
             app_type=app_type,
             path_mappings=path_mappings,
             root_folders=data.get("root_folders", []),
+            webui_url=data.get("webui_url", ""),
+            enabled=data.get("enabled", True),
+            timeout=data.get("timeout", 30),
+            retries=data.get("retries", 2),
         )
     
     def map_path_to_local(self, path: str) -> str:
-        """Map a Servarr path to local filesystem path."""
         for pm in self.path_mappings:
             mapped = pm.to_local(path)
             if mapped != path:
@@ -166,7 +255,6 @@ class ServarrInstance:
         return path
     
     def map_path_to_servarr(self, path: str) -> str:
-        """Map a local path to Servarr path."""
         for pm in self.path_mappings:
             mapped = pm.to_servarr(path)
             if mapped != path:
@@ -174,28 +262,74 @@ class ServarrInstance:
         return path
     
     def get_webui_link(self, media_id: int) -> str:
-        """Generate WebUI link for a media item."""
+        base = self.webui_url or self.url
         if self.app_type == ServarrType.SONARR:
-            return f"{self.url}/series/{media_id}"
+            return f"{base}/series/{media_id}"
         else:
-            return f"{self.url}/movie/{media_id}"
+            return f"{base}/movie/{media_id}"
+    
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "url": self.url,
+            "api_key": self.api_key,
+            "app_type": self.app_type.value,
+            "enabled": self.enabled,
+            "path_mappings": [{"servarr_path": pm.servarr_path, "local_path": pm.local_path} 
+                             for pm in self.path_mappings],
+            "webui_url": self.webui_url,
+        }
 
+
+@dataclass
+class InstanceStatus:
+    """Status report for a Servarr instance."""
+    name: str
+    app_type: str
+    url: str
+    status: str
+    version: str = ""
+    error: str = ""
+    managed_files_count: int = 0
+    queue_items_count: int = 0
+    quality_profiles_count: int = 0
+
+
+# =============================================================================
+# SERVARR CLIENT
+# =============================================================================
 
 class ServarrClient:
-    """HTTP client for Sonarr/Radarr API."""
+    """HTTP client for Sonarr/Radarr API with error handling and retries."""
     
-    def __init__(self, instance: ServarrInstance, timeout: int = 30):
+    def __init__(self, instance: ServarrInstance):
         self.instance = instance
-        self.timeout = timeout
         self._connected = False
+        self._cache: Dict[str, Any] = {}
+        self._cache_time: Dict[str, float] = {}
+        self._cache_ttl = 300
+        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
     
-    def _mask_api_key(self, url: str) -> str:
-        """Mask API key in URL for logging."""
-        return re.sub(r'apikey=[^&]+', 'apikey=***', url)
+    def _get_cached(self, key: str) -> Optional[Any]:
+        if key in self._cache:
+            if time.time() - self._cache_time.get(key, 0) < self._cache_ttl:
+                return self._cache[key]
+        return None
+    
+    def _set_cached(self, key: str, value: Any):
+        self._cache[key] = value
+        self._cache_time[key] = time.time()
     
     def _request(self, endpoint: str, method: str = "GET", 
-                 data: Optional[dict] = None) -> Optional[Any]:
-        """Make API request to Servarr."""
+                 data: Optional[dict] = None, use_cache: bool = True) -> Optional[Any]:
+        cache_key = f"{method}:{endpoint}"
+        if use_cache and method == "GET":
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                return cached
+        
         url = f"{self.instance.url}/api/v3/{endpoint}"
         headers = {
             "X-Api-Key": self.instance.api_key,
@@ -203,89 +337,112 @@ class ServarrClient:
             "Accept": "application/json",
         }
         
-        try:
-            if data:
-                req = urllib.request.Request(
-                    url, 
-                    data=json.dumps(data).encode("utf-8"),
-                    headers=headers,
-                    method=method
-                )
-            else:
-                req = urllib.request.Request(url, headers=headers, method=method)
-            
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                content = response.read()
-                if content:
-                    return json.loads(content)
-                return None
+        last_error = None
+        for attempt in range(self.instance.retries + 1):
+            try:
+                if data:
+                    req = urllib.request.Request(
+                        url, data=json.dumps(data).encode("utf-8"),
+                        headers=headers, method=method
+                    )
+                else:
+                    req = urllib.request.Request(url, headers=headers, method=method)
                 
-        except urllib.error.HTTPError as e:
-            LOG.error(f"[{self.instance.name}] HTTP {e.code} for {endpoint}: {e.reason}")
-            return None
-        except urllib.error.URLError as e:
-            LOG.error(f"[{self.instance.name}] Connection failed: {e.reason}")
-            return None
-        except json.JSONDecodeError as e:
-            LOG.error(f"[{self.instance.name}] Invalid JSON response: {e}")
-            return None
-        except Exception as e:
-            LOG.error(f"[{self.instance.name}] Request error: {e}")
-            return None
+                ctx = self._ssl_ctx if url.startswith("https") else None
+                
+                with urllib.request.urlopen(req, timeout=self.instance.timeout, context=ctx) as response:
+                    content = response.read()
+                    if content:
+                        result = json.loads(content)
+                        if use_cache and method == "GET":
+                            self._set_cached(cache_key, result)
+                        return result
+                    return None
+                    
+            except urllib.error.HTTPError as e:
+                last_error = f"HTTP {e.code}: {e.reason}"
+                if e.code == 401:
+                    self.instance.connection_status = ConnectionStatus.AUTH_ERROR
+                    self.instance.last_error = "Invalid API key"
+                    return None
+                elif e.code == 404:
+                    return None
+                    
+            except urllib.error.URLError as e:
+                last_error = f"Connection failed: {e.reason}"
+                if "timed out" in str(e.reason).lower():
+                    self.instance.connection_status = ConnectionStatus.TIMEOUT
+                    
+            except json.JSONDecodeError as e:
+                last_error = f"Invalid JSON: {e}"
+                
+            except Exception as e:
+                last_error = str(e)
+            
+            if attempt < self.instance.retries:
+                time.sleep(1 * (attempt + 1))
+        
+        self.instance.last_error = last_error or "Unknown error"
+        return None
     
     def connect(self) -> bool:
-        """Test connection and get system info."""
-        status = self._request("system/status")
+        if not self.instance.enabled:
+            self.instance.connection_status = ConnectionStatus.FAILED
+            self.instance.last_error = "Instance disabled"
+            return False
+        
+        status = self._request("system/status", use_cache=False)
         if not status:
+            self.instance.connection_status = ConnectionStatus.FAILED
             LOG.error(f"[{self.instance.name}] Failed to connect to {self.instance.url}")
             return False
         
         self.instance.version = status.get("version", "unknown")
-        # Sonarr v4 has version starting with 4.x
         version_major = int(self.instance.version.split(".")[0]) if self.instance.version else 0
         self.instance.is_v4 = version_major >= 4
+        self.instance.connection_status = ConnectionStatus.CONNECTED
+        self.instance.last_error = ""
         
         LOG.info(f"[{self.instance.name}] Connected: {self.instance.app_type.value} v{self.instance.version}")
         self._connected = True
-        
-        # Load quality profiles
         self._load_quality_profiles()
-        
         return True
     
     def _load_quality_profiles(self):
-        """Load quality profiles from the instance."""
         profiles = self._request("qualityprofile")
         if profiles:
+            self.instance.quality_profiles.clear()
             for p in profiles:
                 qp = QualityProfile.from_dict(p)
                 self.instance.quality_profiles[qp.id] = qp
-            LOG.debug(f"[{self.instance.name}] Loaded {len(self.instance.quality_profiles)} quality profiles")
     
-    def get_root_folders(self) -> List[dict]:
-        """Get configured root folders."""
-        return self._request("rootfolder") or []
+    def get_status(self) -> InstanceStatus:
+        return InstanceStatus(
+            name=self.instance.name,
+            app_type=self.instance.app_type.value,
+            url=self.instance.url,
+            status=self.instance.connection_status.value,
+            version=self.instance.version,
+            error=self.instance.last_error,
+            quality_profiles_count=len(self.instance.quality_profiles),
+        )
     
     def get_all_series(self) -> List[dict]:
-        """Get all series (Sonarr only)."""
         if self.instance.app_type != ServarrType.SONARR:
             return []
         return self._request("series") or []
     
     def get_all_movies(self) -> List[dict]:
-        """Get all movies (Radarr only)."""
         if self.instance.app_type != ServarrType.RADARR:
             return []
         return self._request("movie") or []
     
     def get_episode_files(self, series_id: int) -> List[dict]:
-        """Get all episode files for a series (Sonarr only)."""
         if self.instance.app_type != ServarrType.SONARR:
             return []
         return self._request(f"episodefile?seriesId={series_id}") or []
     
     def get_movie_file(self, movie_id: int) -> Optional[dict]:
-        """Get movie file for a movie (Radarr only)."""
         if self.instance.app_type != ServarrType.RADARR:
             return None
         files = self._request(f"moviefile?movieId={movie_id}")
@@ -294,451 +451,351 @@ class ServarrClient:
         return None
     
     def get_queue(self) -> List[dict]:
-        """Get current download queue."""
-        queue = self._request("queue?pageSize=1000")
-        if queue and "records" in queue:
-            return queue["records"]
-        return []
-    
-    def rescan_series(self, series_id: int) -> bool:
-        """Trigger a rescan for a series (Sonarr only)."""
-        if self.instance.app_type != ServarrType.SONARR:
-            return False
-        result = self._request("command", method="POST", data={
-            "name": "RescanSeries",
-            "seriesId": series_id
-        })
-        return result is not None
-    
-    def rescan_movie(self, movie_id: int) -> bool:
-        """Trigger a rescan for a movie (Radarr only)."""
-        if self.instance.app_type != ServarrType.RADARR:
-            return False
-        result = self._request("command", method="POST", data={
-            "name": "RescanMovie",
-            "movieId": movie_id
-        })
-        return result is not None
+        all_records = []
+        page = 1
+        while True:
+            queue = self._request(f"queue?page={page}&pageSize=100", use_cache=False)
+            if not queue or "records" not in queue:
+                break
+            records = queue["records"]
+            all_records.extend(records)
+            if len(all_records) >= queue.get("totalRecords", 0):
+                break
+            page += 1
+            if page > 20:
+                break
+        return all_records
     
     def get_all_managed_files(self) -> Dict[str, ManagedFile]:
-        """
-        Get all files managed by this instance.
-        Returns dict mapping local_path -> ManagedFile
-        """
         if not self._connected and not self.connect():
             return {}
         
         files: Dict[str, ManagedFile] = {}
-        
-        if self.instance.app_type == ServarrType.SONARR:
-            files = self._get_sonarr_files()
-        else:
-            files = self._get_radarr_files()
-        
-        LOG.info(f"[{self.instance.name}] Found {len(files)} managed files")
+        try:
+            if self.instance.app_type == ServarrType.SONARR:
+                files = self._get_sonarr_files()
+            else:
+                files = self._get_radarr_files()
+            LOG.info(f"[{self.instance.name}] Found {len(files)} managed files")
+        except Exception as e:
+            LOG.error(f"[{self.instance.name}] Failed to get managed files: {e}")
+            self.instance.last_error = str(e)
         return files
     
     def _get_sonarr_files(self) -> Dict[str, ManagedFile]:
-        """Get all episode files from Sonarr."""
         files: Dict[str, ManagedFile] = {}
-        
         series_list = self.get_all_series()
-        LOG.info(f"[{self.instance.name}] Processing {len(series_list)} series")
         
         for series in series_list:
             series_id = series.get("id", 0)
             series_title = series.get("title", "Unknown")
-            quality_profile_id = series.get("qualityProfileId", 0)
-            qp = self.instance.quality_profiles.get(quality_profile_id, QualityProfile(id=0, name="Unknown"))
+            qp_id = series.get("qualityProfileId", 0)
+            qp = self.instance.quality_profiles.get(qp_id, QualityProfile(id=0, name="Unknown"))
             
-            # Filter by root folder if specified
             series_path = series.get("path", "")
             if self.instance.root_folders:
                 if not any(series_path.startswith(rf) for rf in self.instance.root_folders):
                     continue
             
-            episode_files = self.get_episode_files(series_id)
-            
-            for ef in episode_files:
-                file_id = ef.get("id", 0)
+            for ef in self.get_episode_files(series_id):
                 path = ef.get("path", "")
+                if not path:
+                    continue
+                
                 local_path = self.instance.map_path_to_local(path)
-                
-                # Quality info
                 quality_obj = ef.get("quality", {}).get("quality", {})
-                quality_name = quality_obj.get("name", "Unknown")
-                quality_id = quality_obj.get("id", 0)
+                custom_formats = [cf.get("name", "") for cf in ef.get("customFormats", []) if cf.get("name")]
+                cutoff_not_met = ef.get("qualityCutoffNotMet", False)
+                cf_score = ef.get("customFormatScore", 0)
                 
-                # Custom formats (v4 only)
-                custom_formats = []
-                custom_format_score = 0
-                if self.instance.is_v4 and "customFormats" in ef:
-                    for cf in ef.get("customFormats", []):
-                        cf_name = cf.get("name", "")
-                        if cf_name:
-                            custom_formats.append(cf_name)
-                    # Note: Sonarr v4 doesn't always include score on episodeFile
-                
-                # Cutoff status
-                quality_cutoff_not_met = ef.get("qualityCutoffNotMet", False)
-                
-                # Determine upgrade recommendation
                 upgrade_recommended = False
                 upgrade_reason = ""
-                if quality_cutoff_not_met:
+                if cutoff_not_met:
                     upgrade_recommended = True
                     upgrade_reason = "Quality cutoff not met"
-                elif qp.upgrade_allowed and qp.min_upgrade_format_score > 0:
-                    if custom_format_score < qp.min_upgrade_format_score:
-                        upgrade_recommended = True
-                        upgrade_reason = f"CF score {custom_format_score} < min {qp.min_upgrade_format_score}"
                 
                 mf = ManagedFile(
-                    file_id=file_id,
-                    path=path,
-                    local_path=local_path,
-                    size=ef.get("size", 0),
-                    quality=quality_name,
-                    quality_id=quality_id,
-                    custom_format_score=custom_format_score,
-                    custom_formats=custom_formats,
-                    quality_cutoff_not_met=quality_cutoff_not_met,
-                    media_id=series_id,
-                    media_title=series_title,
-                    season_number=ef.get("seasonNumber"),
-                    episode_number=None,  # Would need episode lookup for this
-                    quality_profile_id=quality_profile_id,
-                    quality_profile_name=qp.name,
-                    upgrade_recommended=upgrade_recommended,
+                    file_id=ef.get("id", 0), path=path, local_path=local_path,
+                    size=ef.get("size", 0), quality=quality_obj.get("name", "Unknown"),
+                    quality_id=quality_obj.get("id", 0), custom_format_score=cf_score,
+                    custom_formats=custom_formats, quality_cutoff_not_met=cutoff_not_met,
+                    media_id=series_id, media_title=series_title,
+                    season_number=ef.get("seasonNumber"), quality_profile_id=qp_id,
+                    quality_profile_name=qp.name, upgrade_recommended=upgrade_recommended,
                     upgrade_reason=upgrade_reason,
                     webui_link=self.instance.get_webui_link(series_id),
+                    instance_name=self.instance.name, instance_type=self.instance.app_type.value,
                 )
-                
                 files[local_path] = mf
-        
         return files
     
     def _get_radarr_files(self) -> Dict[str, ManagedFile]:
-        """Get all movie files from Radarr."""
         files: Dict[str, ManagedFile] = {}
-        
         movie_list = self.get_all_movies()
-        LOG.info(f"[{self.instance.name}] Processing {len(movie_list)} movies")
         
         for movie in movie_list:
+            if not movie.get("hasFile", False):
+                continue
+            
             movie_id = movie.get("id", 0)
             movie_title = movie.get("title", "Unknown")
-            quality_profile_id = movie.get("qualityProfileId", 0)
-            qp = self.instance.quality_profiles.get(quality_profile_id, QualityProfile(id=0, name="Unknown"))
+            qp_id = movie.get("qualityProfileId", 0)
+            qp = self.instance.quality_profiles.get(qp_id, QualityProfile(id=0, name="Unknown"))
             
-            # Filter by root folder if specified
             movie_path = movie.get("path", "")
             if self.instance.root_folders:
                 if not any(movie_path.startswith(rf) for rf in self.instance.root_folders):
                     continue
             
-            # Check if movie has a file
-            if not movie.get("hasFile", False):
-                continue
-            
-            mf_data = movie.get("movieFile")
-            if not mf_data:
-                mf_data = self.get_movie_file(movie_id)
-            
+            mf_data = movie.get("movieFile") or self.get_movie_file(movie_id)
             if not mf_data:
                 continue
             
-            file_id = mf_data.get("id", 0)
             path = mf_data.get("path", "")
+            if not path:
+                continue
+            
             local_path = self.instance.map_path_to_local(path)
-            
-            # Quality info
             quality_obj = mf_data.get("quality", {}).get("quality", {})
-            quality_name = quality_obj.get("name", "Unknown")
-            quality_id = quality_obj.get("id", 0)
+            custom_formats = [cf.get("name", "") for cf in mf_data.get("customFormats", []) if cf.get("name")]
+            cf_score = mf_data.get("customFormatScore", 0)
+            cutoff_not_met = mf_data.get("qualityCutoffNotMet", False)
             
-            # Custom formats and score (Radarr has this)
-            custom_formats = []
-            custom_format_score = mf_data.get("customFormatScore", 0)
-            for cf in mf_data.get("customFormats", []):
-                cf_name = cf.get("name", "")
-                if cf_name:
-                    custom_formats.append(cf_name)
-            
-            # Cutoff status
-            quality_cutoff_not_met = mf_data.get("qualityCutoffNotMet", False)
-            
-            # Determine upgrade recommendation
-            upgrade_recommended = False
-            upgrade_reason = ""
-            if quality_cutoff_not_met:
-                upgrade_recommended = True
-                upgrade_reason = "Quality cutoff not met"
-            elif qp.upgrade_allowed:
-                if qp.cutoff_format_score > 0 and custom_format_score < qp.cutoff_format_score:
-                    upgrade_recommended = True
-                    upgrade_reason = f"CF score {custom_format_score} < cutoff {qp.cutoff_format_score}"
+            upgrade_recommended = cutoff_not_met
+            upgrade_reason = "Quality cutoff not met" if cutoff_not_met else ""
             
             mf = ManagedFile(
-                file_id=file_id,
-                path=path,
-                local_path=local_path,
-                size=mf_data.get("size", 0),
-                quality=quality_name,
-                quality_id=quality_id,
-                custom_format_score=custom_format_score,
-                custom_formats=custom_formats,
-                quality_cutoff_not_met=quality_cutoff_not_met,
-                media_id=movie_id,
-                media_title=movie_title,
-                quality_profile_id=quality_profile_id,
-                quality_profile_name=qp.name,
-                upgrade_recommended=upgrade_recommended,
-                upgrade_reason=upgrade_reason,
+                file_id=mf_data.get("id", 0), path=path, local_path=local_path,
+                size=mf_data.get("size", 0), quality=quality_obj.get("name", "Unknown"),
+                quality_id=quality_obj.get("id", 0), custom_format_score=cf_score,
+                custom_formats=custom_formats, quality_cutoff_not_met=cutoff_not_met,
+                media_id=movie_id, media_title=movie_title,
+                quality_profile_id=qp_id, quality_profile_name=qp.name,
+                upgrade_recommended=upgrade_recommended, upgrade_reason=upgrade_reason,
                 webui_link=self.instance.get_webui_link(movie_id),
+                instance_name=self.instance.name, instance_type=self.instance.app_type.value,
             )
-            
             files[local_path] = mf
-        
         return files
     
-    def get_queue_paths(self) -> Set[str]:
-        """Get paths of files currently in download queue."""
-        paths = set()
-        queue = self.get_queue()
-        for item in queue:
-            # Queue items have outputPath when downloading
+    def get_queue_paths(self) -> Dict[str, ProtectionEvidence]:
+        paths: Dict[str, ProtectionEvidence] = {}
+        for item in self.get_queue():
             output_path = item.get("outputPath", "")
             if output_path:
                 local_path = self.instance.map_path_to_local(output_path)
-                paths.add(local_path)
+                paths[local_path] = ProtectionEvidence(
+                    reason=ProtectionReason.IN_QUEUE,
+                    instance_name=self.instance.name,
+                    instance_type=self.instance.app_type.value,
+                    queue_status=item.get("status", "unknown"),
+                    queue_title=item.get("title", ""),
+                )
         return paths
 
 
+# =============================================================================
+# SERVARR MANAGER
+# =============================================================================
+
 class ServarrManager:
-    """
-    Manages multiple Sonarr/Radarr instances.
-    Aggregates files from all instances for protection checks.
-    """
+    """Manages multiple Sonarr/Radarr instances with unified protection checking."""
     
     def __init__(self):
         self.instances: List[ServarrInstance] = []
         self.clients: Dict[str, ServarrClient] = {}
-        
-        # Aggregated data
         self.managed_files: Dict[str, Tuple[ManagedFile, ServarrInstance]] = {}
-        self.queue_paths: Set[str] = set()
+        self.queue_evidence: Dict[str, ProtectionEvidence] = {}
+        self.load_timestamp: Optional[datetime] = None
+        self.instance_stats: Dict[str, dict] = {}
     
     def add_instance(self, instance: ServarrInstance) -> bool:
-        """Add and connect to a Servarr instance."""
+        if not instance.enabled:
+            LOG.info(f"[{instance.name}] Skipping disabled instance")
+            return False
+        
         client = ServarrClient(instance)
-        if client.connect():
-            self.instances.append(instance)
-            self.clients[instance.name] = client
-            return True
-        return False
+        success = client.connect()
+        
+        self.instances.append(instance)
+        self.clients[instance.name] = client
+        self.instance_stats[instance.name] = {
+            "connected": success, "error": instance.last_error if not success else "",
+            "files_count": 0, "queue_count": 0,
+        }
+        return success
     
-    def add_instance_from_config(self, config: dict) -> bool:
-        """Add instance from dictionary config."""
+    def add_instance_from_config(self, config: dict, app_type: Optional[ServarrType] = None) -> bool:
         try:
-            instance = ServarrInstance.from_dict(config)
+            if not config.get("url") or not config.get("api_key"):
+                return False
+            instance = ServarrInstance.from_dict(config, app_type)
             return self.add_instance(instance)
         except Exception as e:
             LOG.error(f"Failed to add instance from config: {e}")
             return False
     
     def load_all_files(self) -> int:
-        """Load all managed files from all instances."""
         self.managed_files.clear()
-        self.queue_paths.clear()
+        self.queue_evidence.clear()
         
         for name, client in self.clients.items():
-            instance = next(i for i in self.instances if i.name == name)
+            instance = client.instance
+            if instance.connection_status != ConnectionStatus.CONNECTED:
+                if not client.connect():
+                    continue
             
-            # Get managed files
-            files = client.get_all_managed_files()
-            for path, mf in files.items():
-                self.managed_files[path] = (mf, instance)
+            try:
+                files = client.get_all_managed_files()
+                for path, mf in files.items():
+                    self.managed_files[path] = (mf, instance)
+                self.instance_stats[name]["files_count"] = len(files)
+            except Exception as e:
+                LOG.error(f"[{name}] Error loading files: {e}")
             
-            # Get queue paths
-            queue_paths = client.get_queue_paths()
-            self.queue_paths.update(queue_paths)
+            try:
+                queue = client.get_queue_paths()
+                self.queue_evidence.update(queue)
+                self.instance_stats[name]["queue_count"] = len(queue)
+            except Exception as e:
+                LOG.error(f"[{name}] Error loading queue: {e}")
         
-        LOG.info(f"Total managed files across all instances: {len(self.managed_files)}")
-        LOG.info(f"Files in download queue: {len(self.queue_paths)}")
-        
+        self.load_timestamp = datetime.now()
+        LOG.info(f"Total managed: {len(self.managed_files)}, Queue: {len(self.queue_evidence)}")
         return len(self.managed_files)
     
     def is_managed(self, path: str) -> bool:
-        """Check if a path is managed by any Servarr instance."""
         return path in self.managed_files
     
     def is_in_queue(self, path: str) -> bool:
-        """Check if a path is in any download queue."""
-        return path in self.queue_paths
+        return path in self.queue_evidence
+    
+    def get_protection_evidence(self, path: str) -> Optional[ProtectionEvidence]:
+        if path in self.queue_evidence:
+            return self.queue_evidence[path]
+        
+        if path in self.managed_files:
+            mf, instance = self.managed_files[path]
+            reason = (ProtectionReason.MANAGED_EPISODE 
+                     if instance.app_type == ServarrType.SONARR 
+                     else ProtectionReason.MANAGED_MOVIE)
+            
+            return ProtectionEvidence(
+                reason=reason, instance_name=instance.name,
+                instance_type=instance.app_type.value, file_id=mf.file_id,
+                media_id=mf.media_id, media_title=mf.media_title,
+                quality=mf.quality, quality_profile=mf.quality_profile_name,
+                custom_formats=mf.custom_formats,
+                custom_format_score=mf.custom_format_score,
+                webui_link=mf.webui_link,
+            )
+        return None
     
     def get_file_info(self, path: str) -> Optional[Tuple[ManagedFile, ServarrInstance]]:
-        """Get file info if managed."""
         return self.managed_files.get(path)
     
-    def trigger_rescan(self, path: str) -> bool:
-        """Trigger a rescan for the media containing this file."""
-        info = self.managed_files.get(path)
-        if not info:
-            return False
-        
-        mf, instance = info
-        client = self.clients.get(instance.name)
-        if not client:
-            return False
-        
-        if instance.app_type == ServarrType.SONARR:
-            return client.rescan_series(mf.media_id)
-        else:
-            return client.rescan_movie(mf.media_id)
+    def get_summary(self) -> dict:
+        return {
+            "total_instances": len(self.instances),
+            "connected_instances": sum(1 for i in self.instances 
+                                       if i.connection_status == ConnectionStatus.CONNECTED),
+            "total_managed_files": len(self.managed_files),
+            "total_queue_items": len(self.queue_evidence),
+            "load_timestamp": self.load_timestamp.isoformat() if self.load_timestamp else None,
+            "instances": self.instance_stats,
+        }
+    
+    def get_instance_statuses(self) -> List[InstanceStatus]:
+        statuses = []
+        for name, client in self.clients.items():
+            status = client.get_status()
+            stats = self.instance_stats.get(name, {})
+            status.managed_files_count = stats.get("files_count", 0)
+            status.queue_items_count = stats.get("queue_count", 0)
+            statuses.append(status)
+        return statuses
 
 
-def parse_instances_from_env() -> List[dict]:
-    """
-    Parse Servarr instance configurations from environment variables.
-    
-    Supports two formats:
-    1. JSON: SONARR_INSTANCES_JSON='[{"name":"main","url":"...","api_key":"..."}]'
-    2. Numbered: SONARR_1_URL, SONARR_1_APIKEY, SONARR_1_NAME, SONARR_1_PATH_MAP
-    
-    Returns list of instance config dicts.
-    """
-    instances = []
-    
-    # Try JSON format first
-    for app_type in ["SONARR", "RADARR"]:
-        json_var = f"{app_type}_INSTANCES_JSON"
-        if json_var in os.environ:
-            try:
-                parsed = json.loads(os.environ[json_var])
-                for inst in parsed:
-                    inst["type"] = app_type.lower()
-                    instances.append(inst)
-            except json.JSONDecodeError as e:
-                LOG.error(f"Failed to parse {json_var}: {e}")
-    
-    # Try numbered format
-    for app_type in ["SONARR", "RADARR"]:
-        for i in range(1, 10):
-            url_var = f"{app_type}_{i}_URL"
-            if url_var in os.environ:
-                inst = {
-                    "type": app_type.lower(),
-                    "name": os.environ.get(f"{app_type}_{i}_NAME", f"{app_type.lower()}_{i}"),
-                    "url": os.environ.get(url_var, ""),
-                    "api_key": os.environ.get(f"{app_type}_{i}_APIKEY", ""),
-                    "path_mappings": [],
-                }
-                
-                # Parse path mappings
-                path_map = os.environ.get(f"{app_type}_{i}_PATH_MAP", "")
-                if path_map:
-                    for mapping in path_map.split(";"):
-                        mapping = mapping.strip()
-                        if ":" in mapping:
-                            inst["path_mappings"].append(mapping)
-                
-                if inst["url"] and inst["api_key"]:
-                    instances.append(inst)
-    
-    # Legacy single-instance format (for backwards compatibility)
-    for app_type in ["SONARR", "RADARR"]:
-        url_var = f"{app_type}_URL"
-        apikey_var = f"{app_type}_APIKEY"
-        if url_var in os.environ and apikey_var in os.environ:
-            # Check we haven't already added this via numbered format
-            url = os.environ[url_var]
-            if not any(i.get("url") == url for i in instances):
-                inst = {
-                    "type": app_type.lower(),
-                    "name": os.environ.get(f"{app_type}_NAME", app_type.lower()),
-                    "url": url,
-                    "api_key": os.environ[apikey_var],
-                    "path_mappings": [],
-                }
-                
-                path_map = os.environ.get(f"{app_type}_PATH_MAP", "")
-                if path_map:
-                    for mapping in path_map.split(";"):
-                        mapping = mapping.strip()
-                        if ":" in mapping:
-                            inst["path_mappings"].append(mapping)
-                
-                instances.append(inst)
-    
-    return instances
+# =============================================================================
+# CLI PARSING HELPERS
+# =============================================================================
 
-
-def parse_instances_from_cli(sonarr_args: List[str], radarr_args: List[str]) -> List[dict]:
-    """
-    Parse Servarr instance configurations from CLI arguments.
+def parse_instance_from_cli_arg(arg: str, app_type: ServarrType) -> Optional[ServarrInstance]:
+    """Parse: name=X,url=Y,apikey=Z[,path_map=A:B]"""
+    parts = {}
+    path_maps = []
     
-    Format: name=MyName,url=http://...,apikey=...,path_map=remote:local
-    
-    Returns list of instance config dicts.
-    """
-    instances = []
-    
-    for arg in sonarr_args:
-        inst = _parse_cli_instance_arg(arg, "sonarr")
-        if inst:
-            instances.append(inst)
-    
-    for arg in radarr_args:
-        inst = _parse_cli_instance_arg(arg, "radarr")
-        if inst:
-            instances.append(inst)
-    
-    return instances
-
-
-def _parse_cli_instance_arg(arg: str, app_type: str) -> Optional[dict]:
-    """Parse a single CLI instance argument."""
-    inst = {
-        "type": app_type,
-        "name": app_type,
-        "url": "",
-        "api_key": "",
-        "path_mappings": [],
-    }
-    
-    for part in arg.split(","):
-        if "=" in part:
-            key, value = part.split("=", 1)
+    for item in arg.split(","):
+        if "=" in item:
+            key, value = item.split("=", 1)
             key = key.strip().lower()
             value = value.strip()
-            
-            if key == "name":
-                inst["name"] = value
-            elif key == "url":
-                inst["url"] = value
-            elif key in ("apikey", "api_key", "key"):
-                inst["api_key"] = value
-            elif key in ("path_map", "pathmap"):
-                inst["path_mappings"].append(value)
+            if key == "path_map":
+                if ":" in value:
+                    pm_parts = value.split(":", 1)
+                    path_maps.append(PathMapping(pm_parts[0], pm_parts[1]))
+            else:
+                parts[key] = value
     
-    if inst["url"] and inst["api_key"]:
-        return inst
-    return None
+    if not parts.get("url") or not parts.get("apikey"):
+        return None
+    
+    return ServarrInstance(
+        name=parts.get("name", app_type.value),
+        url=parts["url"], api_key=parts["apikey"],
+        app_type=app_type, path_mappings=path_maps,
+    )
 
 
-def load_instances_from_json_file(filepath: str) -> List[dict]:
-    """Load instance configurations from a JSON file."""
-    try:
-        with open(filepath, "r") as f:
-            data = json.load(f)
-            if isinstance(data, list):
-                return data
-            elif isinstance(data, dict):
-                # Support single instance or {"instances": [...]}
-                if "instances" in data:
-                    return data["instances"]
-                return [data]
-    except Exception as e:
-        LOG.error(f"Failed to load instances from {filepath}: {e}")
-    return []
+def parse_instances_from_env(app_type: ServarrType) -> List[ServarrInstance]:
+    """Parse instances from environment variables."""
+    instances = []
+    prefix = app_type.value.upper()
+    
+    json_var = f"{prefix}_INSTANCES_JSON"
+    if os.environ.get(json_var):
+        try:
+            configs = json.loads(os.environ[json_var])
+            for cfg in configs:
+                inst = ServarrInstance.from_dict(cfg, app_type)
+                if inst.url and inst.api_key:
+                    instances.append(inst)
+            return instances
+        except Exception as e:
+            LOG.error(f"Failed to parse {json_var}: {e}")
+    
+    url = os.environ.get(f"{prefix}_URL")
+    apikey = os.environ.get(f"{prefix}_APIKEY")
+    if url and apikey:
+        path_maps = []
+        if os.environ.get(f"{prefix}_PATH_MAP"):
+            for pm in os.environ[f"{prefix}_PATH_MAP"].split(";"):
+                if ":" in pm:
+                    parts = pm.split(":", 1)
+                    path_maps.append(PathMapping(parts[0], parts[1]))
+        
+        instances.append(ServarrInstance(
+            name=os.environ.get(f"{prefix}_NAME", app_type.value.lower()),
+            url=url, api_key=apikey, app_type=app_type,
+            path_mappings=path_maps,
+            webui_url=os.environ.get(f"{prefix}_WEBUI_URL", ""),
+        ))
+    
+    for i in range(1, 11):
+        url = os.environ.get(f"{prefix}_{i}_URL")
+        apikey = os.environ.get(f"{prefix}_{i}_APIKEY")
+        if url and apikey:
+            path_maps = []
+            if os.environ.get(f"{prefix}_{i}_PATH_MAP"):
+                for pm in os.environ[f"{prefix}_{i}_PATH_MAP"].split(";"):
+                    if ":" in pm:
+                        parts = pm.split(":", 1)
+                        path_maps.append(PathMapping(parts[0], parts[1]))
+            
+            instances.append(ServarrInstance(
+                name=os.environ.get(f"{prefix}_{i}_NAME", f"{app_type.value.lower()}-{i}"),
+                url=url, api_key=apikey, app_type=app_type,
+                path_mappings=path_maps,
+            ))
+    
+    return instances

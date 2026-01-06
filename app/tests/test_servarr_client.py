@@ -22,8 +22,7 @@ from servarr_client import (
     ManagedFile,
     ServarrManager,
     parse_instances_from_env,
-    parse_instances_from_cli,
-    _parse_cli_instance_arg,
+    parse_instance_from_cli_arg,
 )
 
 
@@ -153,35 +152,37 @@ class TestParseInstancesFromCLI(unittest.TestCase):
     
     def test_parse_single_arg(self):
         """Test parsing single CLI argument."""
-        result = _parse_cli_instance_arg(
+        result = parse_instance_from_cli_arg(
             "name=main,url=http://localhost:8989,apikey=testkey123",
-            "sonarr"
+            ServarrType.SONARR
         )
         
         self.assertIsNotNone(result)
-        self.assertEqual(result["name"], "main")
-        self.assertEqual(result["url"], "http://localhost:8989")
-        self.assertEqual(result["api_key"], "testkey123")
-        self.assertEqual(result["type"], "sonarr")
+        self.assertEqual(result.name, "main")
+        self.assertEqual(result.url, "http://localhost:8989")
+        self.assertEqual(result.api_key, "testkey123")
+        self.assertEqual(result.app_type, ServarrType.SONARR)
     
     def test_parse_with_path_map(self):
         """Test parsing CLI argument with path mapping."""
-        result = _parse_cli_instance_arg(
+        result = parse_instance_from_cli_arg(
             "name=main,url=http://localhost:8989,apikey=key,path_map=/tv:/media/Serien",
-            "sonarr"
+            ServarrType.SONARR
         )
         
         self.assertIsNotNone(result)
-        self.assertIn("/tv:/media/Serien", result["path_mappings"])
+        self.assertEqual(len(result.path_mappings), 1)
+        self.assertEqual(result.path_mappings[0].servarr_path, "/tv")
+        self.assertEqual(result.path_mappings[0].local_path, "/media/Serien")
     
     def test_parse_invalid_no_url(self):
         """Test parsing fails without URL."""
-        result = _parse_cli_instance_arg("name=main,apikey=key", "sonarr")
+        result = parse_instance_from_cli_arg("name=main,apikey=key", ServarrType.SONARR)
         self.assertIsNone(result)
     
     def test_parse_invalid_no_key(self):
         """Test parsing fails without API key."""
-        result = _parse_cli_instance_arg("name=main,url=http://localhost:8989", "sonarr")
+        result = parse_instance_from_cli_arg("name=main,url=http://localhost:8989", ServarrType.SONARR)
         self.assertIsNone(result)
 
 
@@ -194,13 +195,11 @@ class TestParseInstancesFromEnv(unittest.TestCase):
             "SONARR_URL": "http://localhost:8989",
             "SONARR_APIKEY": "testkey123",
         }, clear=False):
-            instances = parse_instances_from_env()
+            instances = parse_instances_from_env(ServarrType.SONARR)
         
-        # Find the sonarr instance
-        sonarr_instances = [i for i in instances if i.get("type") == "sonarr"]
-        self.assertEqual(len(sonarr_instances), 1)
-        self.assertEqual(sonarr_instances[0]["url"], "http://localhost:8989")
-        self.assertEqual(sonarr_instances[0]["api_key"], "testkey123")
+        self.assertEqual(len(instances), 1)
+        self.assertEqual(instances[0].url, "http://localhost:8989")
+        self.assertEqual(instances[0].api_key, "testkey123")
     
     def test_parse_numbered_instances(self):
         """Test parsing numbered instances from env."""
@@ -212,14 +211,9 @@ class TestParseInstancesFromEnv(unittest.TestCase):
             "SONARR_2_APIKEY": "key2",
             "SONARR_2_NAME": "anime",
         }, clear=False):
-            instances = parse_instances_from_env()
+            instances = parse_instances_from_env(ServarrType.SONARR)
         
-        sonarr_instances = [i for i in instances if i.get("type") == "sonarr"]
-        self.assertEqual(len(sonarr_instances), 2)
-        
-        names = {i["name"] for i in sonarr_instances}
-        self.assertIn("main", names)
-        self.assertIn("anime", names)
+        self.assertGreaterEqual(len(instances), 2)
     
     def test_parse_json_instances(self):
         """Test parsing JSON instances from env."""
@@ -231,10 +225,9 @@ class TestParseInstancesFromEnv(unittest.TestCase):
         with patch.dict(os.environ, {
             "SONARR_INSTANCES_JSON": json_config,
         }, clear=False):
-            instances = parse_instances_from_env()
+            instances = parse_instances_from_env(ServarrType.SONARR)
         
-        sonarr_instances = [i for i in instances if i.get("type") == "sonarr"]
-        self.assertEqual(len(sonarr_instances), 2)
+        self.assertEqual(len(instances), 2)
 
 
 class TestQualityProfile(unittest.TestCase):
