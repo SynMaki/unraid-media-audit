@@ -15,6 +15,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
@@ -348,6 +349,37 @@ async def get_artifact(run_id: str, filename: str, authenticated: bool = Depends
     return FileResponse(path=file_path, filename=filename, media_type=media_type)
 
 
+@app.delete("/api/runs/{run_id}")
+async def delete_run(run_id: str, authenticated: bool = Depends(require_auth)):
+    """Delete a report run and all its files."""
+    # Validate run_id format to prevent path traversal
+    if not re.match(r'^run-\d{8}-\d{6}$', run_id):
+        raise HTTPException(status_code=400, detail="Invalid run ID format")
+
+    report_dir = settings.get("general", "report_dir") or "/reports"
+    run_path = Path(report_dir) / run_id
+
+    if not run_path.exists():
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    if not run_path.is_dir():
+        raise HTTPException(status_code=400, detail="Invalid report path")
+
+    # Verify the path is within report_dir (prevent path traversal)
+    try:
+        run_path.resolve().relative_to(Path(report_dir).resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid report path")
+
+    try:
+        shutil.rmtree(run_path)
+        LOG.info(f"Deleted report run: {run_id}")
+        return {"success": True, "message": f"Report {run_id} deleted"}
+    except Exception as e:
+        LOG.error(f"Failed to delete report {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete report: {str(e)}")
+
+
 # =============================================================================
 # SETTINGS API
 # =============================================================================
@@ -449,8 +481,10 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 1.8rem; background: line
 .run-item { display: flex; justify-content: space-between; align-items: center; padding: 12px; background: var(--bg-secondary); border-radius: 8px; margin-bottom: 8px; }
 .run-title { font-weight: 600; font-size: 0.9rem; }
 .run-stats { font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px; }
-.run-actions { display: flex; gap: 8px; }
+.run-actions { display: flex; gap: 8px; align-items: center; }
 .run-actions a { color: var(--accent); text-decoration: none; font-size: 0.8rem; }
+.btn-delete { background: transparent; border: 1px solid var(--error); color: var(--error); padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.75rem; transition: all 0.2s; }
+.btn-delete:hover { background: var(--error); color: white; }
 .empty-state { text-align: center; color: var(--text-secondary); padding: 40px; }
 .progress-bar { background: var(--bg-primary); border-radius: 10px; height: 6px; margin-top: 12px; overflow: hidden; }
 .progress-fill { background: linear-gradient(90deg, var(--accent), var(--success)); height: 100%; transition: width 0.3s; }
@@ -603,7 +637,7 @@ def get_dashboard_html() -> str:
                 const list = document.getElementById('runsList');
                 if (!data.runs.length) {{ list.innerHTML = '<div class="empty-state">No reports yet. Run an audit to get started.</div>'; return; }}
                 list.innerHTML = data.runs.slice(0, 8).map(r => `
-                    <div class="run-item">
+                    <div class="run-item" id="run-${{r.id}}">
                         <div>
                             <div class="run-title">${{r.id}}</div>
                             <div class="run-stats">📁 ${{r.summary.scanned_files}} files · 🔄 ${{r.summary.episode_duplicate_groups}} dupes · 🗑️ ${{r.summary.delete_candidates_count}} deletable · 🌱 ${{r.summary.seeding_files_protected}} seeding</div>
@@ -611,9 +645,24 @@ def get_dashboard_html() -> str:
                         <div class="run-actions">
                             ${{r.files['report.html'] ? '<a href="/runs/' + r.id + '/report.html" target="_blank">📊 Report</a>' : ''}}
                             ${{r.files['delete_plan.sh'] ? '<a href="/runs/' + r.id + '/artifact/delete_plan.sh">📜 Script</a>' : ''}}
+                            <button class="btn-delete" onclick="deleteRun('${{r.id}}')" title="Delete this report">🗑️</button>
                         </div>
                     </div>`).join('');
             }} catch (err) {{ document.getElementById('runsList').innerHTML = '<div class="empty-state">Failed to load</div>'; }}
+        }}
+        async function deleteRun(runId) {{
+            if (!confirm('Delete report ' + runId + '?\\n\\nThis will permanently delete all report files.')) return;
+            try {{
+                const resp = await fetch('/api/runs/' + runId, {{ method: 'DELETE' }});
+                const data = await resp.json();
+                if (resp.ok) {{
+                    document.getElementById('run-' + runId).remove();
+                    const list = document.getElementById('runsList');
+                    if (!list.children.length) list.innerHTML = '<div class="empty-state">No reports yet. Run an audit to get started.</div>';
+                }} else {{
+                    alert('Failed to delete: ' + (data.detail || 'Unknown error'));
+                }}
+            }} catch (err) {{ alert('Error: ' + err.message); }}
         }}
         loadRuns();
     </script>

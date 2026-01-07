@@ -1,7 +1,7 @@
 # Media Audit - Docker Container for Unraid
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.4.2-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-3.4.3-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/github/license/SynMaki/unraid-media-audit?style=flat-square" alt="License">
 </p>
 
@@ -11,11 +11,11 @@
 
 ---
 
-## What's New in v3.4.2
+## What's New in v3.4.3
 
-- **Torrent Ratio Display**: See the share ratio for each seeding file - helps decide what to delete!
-- **Ratio in Reports**: CSV exports and HTML report now show torrent ratio
-- **Smarter Decisions**: High ratio (e.g., 2.0+) = file has been shared enough, safe to delete
+- **Delete Reports from Web UI**: Clean up old reports directly from the dashboard
+- **Confirmation Dialog**: Safety prompt before deleting reports
+- **Secure Deletion**: Path validation prevents directory traversal attacks
 
 ---
 
@@ -321,6 +321,11 @@ docker logs -f media-audit  # Follow live
 ---
 
 ## Changelog
+
+### v3.4.3 (2026-01-07)
+- NEW: Delete reports from web dashboard
+- NEW: Confirmation dialog before deletion
+- NEW: Secure path validation
 
 ### v3.4.2 (2026-01-07)
 - NEW: Torrent ratio display for seeding files

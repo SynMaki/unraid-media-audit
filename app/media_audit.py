@@ -2,8 +2,13 @@
 """
 media_audit.py — Unraid Plex/Sonarr/Torrents Audit (dry-run by default)
 
-Version: 3.4.2
+Version: 3.4.3
 Changelog:
+- 2026-01-07 [AI] v3.4.3 - Report Deletion from Web UI
+  - NEW: Delete reports directly from the web dashboard
+  - NEW: Delete button with confirmation dialog for each report
+  - NEW: Secure deletion with path validation to prevent exploits
+
 - 2026-01-07 [AI] v3.4.2 - Torrent Ratio Display
   - NEW: Show torrent ratio for seeding files in HTML report
   - NEW: Ratio column in CSV exports (missing_hardlinks.csv, all_seeding.csv, seeding_not_in_arr.csv)
@@ -82,7 +87,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "3.4.2"
+VERSION = "3.4.3"
 
 # =============================================================================
 # CONFIGURATION
