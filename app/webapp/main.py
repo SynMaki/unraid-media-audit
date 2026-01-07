@@ -175,7 +175,9 @@ class JobManager:
             if qbit.get("username"): cmd.extend(["--qbit-user", qbit["username"]])
             if qbit.get("password"): cmd.extend(["--qbit-pass", qbit["password"]])
             for mapping in qbit.get("path_mappings", []):
-                qp, lp = mapping.get("qbit_path", ""), mapping.get("local_path", "")
+                # Support both "servarr_path" (new) and "qbit_path" (legacy) field names
+                qp = mapping.get("servarr_path", "") or mapping.get("qbit_path", "")
+                lp = mapping.get("local_path", "")
                 if qp and lp: cmd.extend(["--qbit-path-map", f"{qp}:{lp}"])
         else:
             cmd.append("--no-qbit")
