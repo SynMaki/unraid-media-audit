@@ -2,12 +2,19 @@
 """
 media_audit.py — Unraid Plex/Sonarr/Torrents Audit (dry-run by default)
 
-Version: 3.4.0
+Version: 3.4.1
 Changelog:
+- 2026-01-07 [AI] v3.4.1 - Missing Hardlinks Detection
+  - NEW: Missing Hardlinks report - shows files that are in BOTH Sonarr AND qBittorrent but WITHOUT hardlink (wasted space!)
+  - NEW: Seeding overview section in HTML report
+  - NEW: CSV exports: missing_hardlinks.csv, all_seeding.csv, seeding_not_in_arr.csv
+  - NEW: Summary stats: missing_hardlinks_count, missing_hardlinks_wasted_gb, seeding_with_hardlink, seeding_not_in_arr
+
 - 2026-01-07 [AI] v3.4.0 - Path Mapping Fix & Report Improvements
   - FIX: qBittorrent now uses content_path for accurate file location
   - FIX: Added category support for qBittorrent path mapping
   - FIX: Improved path mapping logging for debugging
+  - FIX: webapp now reads servarr_path field for qBittorrent path mappings
   - NEW: Sonarr/Radarr status section in HTML report
   - NEW: Source column shows Seeding/Arr-Managed status with badges
   - NEW: Filter button for Arr-Managed files
@@ -69,7 +76,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 
 # =============================================================================
 # CONFIGURATION
@@ -2081,6 +2088,35 @@ def generate_html_report(
             </div>
         </div>
 
+        <!-- Missing Hardlinks Warning -->
+        <div class="section" style="background: linear-gradient(135deg, rgba(255, 71, 87, 0.15), rgba(255, 165, 2, 0.1));">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;">
+                <div>
+                    <h3 style="color:var(--accent-red);margin-bottom:8px;">⚠️ Missing Hardlinks (Platzverschwendung)</h3>
+                    <p style="color:var(--text-secondary);font-size:0.9rem;">
+                        <strong style="color:var(--accent-red);">{summary.get("missing_hardlinks_count", 0):,}</strong> Dateien ohne Hardlink &nbsp;|&nbsp;
+                        <strong style="color:var(--accent-red);">{summary.get("missing_hardlinks_wasted_gb", 0):.1f} GB</strong> verschwendet &nbsp;|&nbsp;
+                        <strong style="color:var(--accent-yellow);">{summary.get("seeding_not_in_arr", 0):,}</strong> Torrents nicht in Arr
+                    </p>
+                    <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:5px;">
+                        Diese Dateien sind sowohl in Sonarr/Radarr als auch in qBittorrent, aber OHNE Hardlink - sie belegen 2x Speicherplatz!
+                    </p>
+                </div>
+            </div>
+            <details style="margin-top:15px;">
+                <summary style="cursor:pointer;color:var(--accent-yellow);">📋 Seeding Übersicht ({summary.get("seeding_files_total", 0):,} Dateien)</summary>
+                <div style="margin-top:10px;padding:10px;background:var(--bg-primary);border-radius:8px;">
+                    <p><strong>🌱 Gesamt seedend:</strong> {summary.get("seeding_files_total", 0):,}</p>
+                    <p><strong>🔗 Mit Hardlink:</strong> {summary.get("seeding_with_hardlink", 0):,}</p>
+                    <p><strong>⚠️ Ohne Hardlink (in Arr):</strong> {summary.get("missing_hardlinks_count", 0):,}</p>
+                    <p><strong>❓ Nicht in Arr:</strong> {summary.get("seeding_not_in_arr", 0):,}</p>
+                    <p style="margin-top:10px;font-size:0.85rem;color:var(--text-secondary);">
+                        CSV-Reports: <code>missing_hardlinks.csv</code>, <code>all_seeding.csv</code>, <code>seeding_not_in_arr.csv</code>
+                    </p>
+                </div>
+            </details>
+        </div>
+
         <!-- Warnings -->
         {warnings_html}
 
@@ -2491,6 +2527,54 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
     hl_rows = [{"dev": dev, "inode": ino, "nlink": mm.nlink, "size": mm.size, "path": mm.path}
                for (dev, ino), items in sorted(hardlinked.items()) for mm in items]
 
+    # Missing Hardlinks Detection
+    # Files that are BOTH arr_managed AND is_seeding BUT have nlink=1
+    # This means the file exists twice (once in Plex library, once in torrent folder) without hardlink
+    missing_hardlinks = []
+    for m in media:
+        if m.arr_managed and m.is_seeding and m.nlink == 1:
+            missing_hardlinks.append({
+                "path": m.path,
+                "size": m.size,
+                "arr_app": m.arr_app or "",
+                "arr_instance": m.arr_instance or "",
+                "arr_title": m.arr_title or "",
+                "torrent_name": m.torrent_name or "",
+                "nlink": m.nlink,
+                "wasted_space": m.size,  # File exists 2x, so this space is wasted
+            })
+
+    # Also find seeding files without arr management (could be orphaned torrents)
+    seeding_not_arr = []
+    for m in media:
+        if m.is_seeding and not m.arr_managed:
+            seeding_not_arr.append({
+                "path": m.path,
+                "size": m.size,
+                "torrent_name": m.torrent_name or "",
+                "torrent_hash": m.torrent_hash or "",
+                "nlink": m.nlink,
+            })
+
+    # All seeding files for reference
+    all_seeding = []
+    for m in media:
+        if m.is_seeding:
+            all_seeding.append({
+                "path": m.path,
+                "size": m.size,
+                "torrent_name": m.torrent_name or "",
+                "arr_managed": m.arr_managed,
+                "arr_app": m.arr_app or "",
+                "arr_title": m.arr_title or "",
+                "nlink": m.nlink,
+                "has_hardlink": m.nlink > 1,
+            })
+
+    missing_hardlink_size = sum(m["wasted_space"] for m in missing_hardlinks)
+    LOG.info(f"Missing hardlinks: {len(missing_hardlinks)} files ({missing_hardlink_size / (1024**3):.2f} GB wasted)")
+    LOG.info(f"Seeding files not in Arr: {len(seeding_not_arr)}")
+
     # Write CSVs
     file_rows = [flatten_file_row(m) for m in media]
     write_csv(report_run / "files.csv", file_rows, list(file_rows[0].keys()) if file_rows else ["path"])
@@ -2499,10 +2583,14 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
     write_csv(report_run / "season_folder_conflicts.csv", season_conflicts, list(season_conflicts[0].keys()) if season_conflicts else ["show"])
     write_csv(report_run / "language_flags.csv", lang_rows, list(lang_rows[0].keys()) if lang_rows else ["path"])
     write_csv(report_run / "hardlinks.csv", hl_rows, list(hl_rows[0].keys()) if hl_rows else ["dev"])
+    write_csv(report_run / "missing_hardlinks.csv", missing_hardlinks, list(missing_hardlinks[0].keys()) if missing_hardlinks else ["path"])
+    write_csv(report_run / "all_seeding.csv", all_seeding, list(all_seeding[0].keys()) if all_seeding else ["path"])
+    write_csv(report_run / "seeding_not_in_arr.csv", seeding_not_arr, list(seeding_not_arr[0].keys()) if seeding_not_arr else ["path"])
 
     # Summary
     ffprobe_errors = sum(1 for m in media if m.ffprobe_error)
     seeding_files = sum(1 for m in media if m.is_seeding)
+    seeding_with_hardlink = sum(1 for m in media if m.is_seeding and m.nlink > 1)
     arr_managed_files = sum(1 for m in media if m.arr_managed)
     arr_upgrade_recommended = sum(1 for m in media if m.arr_upgrade_recommended)
     summary = {
@@ -2511,6 +2599,10 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
         "hardlink_groups": len(hardlinked), "hardlinked_paths": sum(len(v) for v in hardlinked.values()),
         "season_folder_conflicts": len(season_conflicts), "delete_candidates_count": len(delete_candidates),
         "seeding_files_protected": seeding_protected, "seeding_files_total": seeding_files,
+        "seeding_with_hardlink": seeding_with_hardlink,
+        "missing_hardlinks_count": len(missing_hardlinks),
+        "missing_hardlinks_wasted_gb": round(missing_hardlink_size / (1024**3), 2),
+        "seeding_not_in_arr": len(seeding_not_arr),
         "arr_managed_files": arr_managed_files, "arr_protected": arr_protected,
         "arr_upgrade_recommended": arr_upgrade_recommended,
         "ffprobe_scope": ffprobe_scope, "ffprobe_found": bool(fp_bin), "ffprobe_errors": ffprobe_errors,
