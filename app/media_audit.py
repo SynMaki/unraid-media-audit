@@ -2,8 +2,17 @@
 """
 media_audit.py — Unraid Plex/Sonarr/Torrents Audit (dry-run by default)
 
-Version: 3.0.0
+Version: 3.4.0
 Changelog:
+- 2026-01-07 [AI] v3.4.0 - Path Mapping Fix & Report Improvements
+  - FIX: qBittorrent now uses content_path for accurate file location
+  - FIX: Added category support for qBittorrent path mapping
+  - FIX: Improved path mapping logging for debugging
+  - NEW: Sonarr/Radarr status section in HTML report
+  - NEW: Source column shows Seeding/Arr-Managed status with badges
+  - NEW: Filter button for Arr-Managed files
+  - NEW: Detailed logging for path mapping issues
+
 - 2025-01-05 [AI] v3.0.0 - Sonarr/Radarr Integration
   - NEW: Multiple Sonarr/Radarr instance support
   - NEW: Files managed by Arr are protected from deletion (PROTECTED)
@@ -60,7 +69,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "3.0.0"
+VERSION = "3.4.0"
 
 # =============================================================================
 # CONFIGURATION
@@ -262,14 +271,31 @@ class QBittorrentClient:
         result = self._request("torrents/delete", data)
         return result is not None
     
+    def get_categories(self) -> Dict[str, dict]:
+        """Get all categories with their save paths."""
+        if not self._logged_in and not self.login():
+            return {}
+
+        result = self._request("torrents/categories")
+        if result:
+            try:
+                categories = json.loads(result)
+                LOG.info(f"qBittorrent categories: {list(categories.keys())}")
+                return categories
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
     def get_all_torrent_files_with_inodes(self, path_mappings: Optional[Dict[str, str]] = None) -> Tuple[Dict[str, dict], Dict[Tuple[int, int], dict], Dict[str, dict]]:
         """
         Get all files from ALL torrents.
-        
+
+        Uses content_path for accurate file location (handles categories properly).
+
         Args:
-            path_mappings: Dict mapping container paths to host paths
-                           e.g. {"/downloads": "/mnt/user/data/torrents"}
-        
+            path_mappings: Dict mapping qBittorrent container paths to local scanner paths
+                           e.g. {"/data/torrents": "/media/torrents"}
+
         Returns:
           - path_map: {absolute_file_path: info}
           - inode_map: {(dev, inode): info} for hardlink matching
@@ -279,11 +305,17 @@ class QBittorrentClient:
         inode_map = {}
         filename_map = {}  # Fallback: match by filename only
         torrents = self.get_torrents()
-        
+
         if not torrents:
             LOG.warning("No torrents returned from qBittorrent")
             return {}, {}, {}
-        
+
+        # Get categories for debugging
+        categories = self.get_categories()
+        if categories:
+            for cat_name, cat_info in categories.items():
+                LOG.debug(f"Category '{cat_name}': savePath={cat_info.get('savePath', 'N/A')}")
+
         path_mappings = path_mappings or {}
         inode_errors = 0
         inode_success = 0
@@ -326,71 +358,122 @@ class QBittorrentClient:
         # Log first few paths for debugging
         first_paths_logged = 0
         skipped_states = 0
-        
+
+        # Log path mappings for debugging
+        if path_mappings:
+            LOG.info(f"qBittorrent path mappings configured: {len(path_mappings)}")
+            for qbit_path, local_path in path_mappings.items():
+                LOG.info(f"  Mapping: '{qbit_path}' -> '{local_path}'")
+        else:
+            LOG.warning("No qBittorrent path mappings configured!")
+
+        # Log first torrent details for debugging
+        if torrents:
+            t = torrents[0]
+            LOG.info(f"First torrent example:")
+            LOG.info(f"  name: {t.get('name', 'N/A')}")
+            LOG.info(f"  save_path: {t.get('save_path', 'N/A')}")
+            LOG.info(f"  content_path: {t.get('content_path', 'N/A')}")
+            LOG.info(f"  category: {t.get('category', '(none)')}")
+            LOG.info(f"  state: {t.get('state', 'N/A')}")
+
         for torrent in torrents:
             torrent_hash = torrent.get("hash", "")
             torrent_name = torrent.get("name", "")
             state = torrent.get("state", "")
             save_path = torrent.get("save_path", "").rstrip("/")
-            
+            content_path = torrent.get("content_path", "").rstrip("/")  # Full path to content
+            category = torrent.get("category", "")
+
             # Skip completed/paused torrents that aren't seeding
             # NOTE: We process ALL states but mark the state in info for later filtering
             is_active = state in ACTIVE_STATES
-            
-            # Apply path mapping (container path -> host path)
-            host_save_path = save_path
+
+            # Determine the base path for files
+            # content_path is more accurate as it includes the torrent name folder for multi-file torrents
+            # save_path is just the parent directory
+            base_path = content_path if content_path else save_path
+
+            # Apply path mapping (qBittorrent container path -> local scanner path)
+            host_base_path = base_path
             mapping_applied = False
+            matched_mapping = None
             for container_path, host_path in path_mappings.items():
-                if save_path.startswith(container_path):
-                    host_save_path = save_path.replace(container_path, host_path, 1)
+                # Normalize paths for comparison
+                container_path_normalized = container_path.rstrip("/")
+                if base_path.startswith(container_path_normalized):
+                    host_base_path = base_path.replace(container_path_normalized, host_path.rstrip("/"), 1)
                     mapping_applied = True
+                    matched_mapping = f"{container_path} -> {host_path}"
                     break
-            
+
             # Get files in this torrent
             files = self.get_torrent_files(torrent_hash)
+
+            # For single-file torrents, content_path IS the file path
+            # For multi-file torrents, content_path is the directory
+            is_single_file = len(files) == 1 and not files[0].get("name", "").count("/")
+
             for f in files:
                 file_name = f.get("name", "")
                 if not file_name:
                     continue
-                    
+
                 # Skip sample files
                 file_lower = file_name.lower()
                 if "/sample/" in file_lower or file_lower.startswith("sample") or "-sample." in file_lower:
                     continue
-                
+
                 # Skip non-video files
                 if not any(file_lower.endswith(ext) for ext in ('.mkv', '.mp4', '.avi', '.m4v', '.ts', '.wmv', '.mov')):
                     continue
-                
-                # Use HOST path for matching
-                abs_path = os.path.join(host_save_path, file_name)
-                
+
+                # Calculate the absolute file path
+                if is_single_file:
+                    # For single-file torrents, content_path is the complete file path
+                    container_file_path = content_path
+                else:
+                    # For multi-file torrents, append file name to save_path (not content_path!)
+                    # file_name already contains the relative path from save_path
+                    container_file_path = os.path.join(save_path, file_name)
+
+                # Apply path mapping to the container file path
+                abs_path = container_file_path
+                for container_path, host_path in path_mappings.items():
+                    container_path_normalized = container_path.rstrip("/")
+                    if container_file_path.startswith(container_path_normalized):
+                        abs_path = container_file_path.replace(container_path_normalized, host_path.rstrip("/"), 1)
+                        mapping_applied = True
+                        break
+
                 info = {
                     "torrent_hash": torrent_hash,
                     "torrent_name": torrent_name,
                     "state": state,
                     "is_active": is_active,
-                    "save_path": host_save_path,
+                    "category": category,
+                    "save_path": save_path,
+                    "content_path": content_path,
                     "torrent_file_name": file_name,
                     "torrent_path": abs_path,
-                    "container_path": os.path.join(save_path, file_name),  # Original container path
+                    "container_path": container_file_path,
                     "mapping_applied": mapping_applied,
                 }
-                
+
                 path_map[abs_path] = info
-                
+
                 # Add to filename map (just the basename, lowercase)
                 basename = os.path.basename(file_name).lower()
                 filename_map[basename] = info
-                
+
                 # Log first few paths for debugging
                 if first_paths_logged < 5:
-                    LOG.debug(f"Torrent file: state={state} active={is_active}")
-                    LOG.debug(f"  container: {os.path.join(save_path, file_name)}")
-                    LOG.debug(f"  host:      {abs_path}")
-                    LOG.debug(f"  mapping:   {mapping_applied}")
+                    LOG.info(f"Torrent file #{first_paths_logged + 1}: state={state} active={is_active} category='{category}'")
+                    LOG.info(f"  qBit container path: {container_file_path}")
+                    LOG.info(f"  Mapped local path:   {abs_path}")
+                    LOG.info(f"  Mapping applied:     {mapping_applied}")
                     first_paths_logged += 1
-                
+
                 # Get inode for hardlink matching
                 try:
                     st = os.stat(abs_path)
@@ -400,8 +483,9 @@ class QBittorrentClient:
                 except OSError as e:
                     inode_errors += 1
                     # Log first few errors for debugging
-                    if inode_errors <= 3:
-                        LOG.debug(f"Cannot stat torrent file: {abs_path} - {e}")
+                    if inode_errors <= 5:
+                        LOG.warning(f"Cannot stat torrent file: {abs_path}")
+                        LOG.warning(f"  (container was: {container_file_path})")
         
         LOG.info(f"Indexed {len(path_map)} torrent files, {inode_success} with inodes, {inode_errors} stat errors")
         LOG.info(f"Filename map has {len(filename_map)} unique filenames for fallback matching")
@@ -1489,7 +1573,7 @@ def generate_html_report(
                     <button class="btn btn-info" onclick="copyDeleteCommand('{show_escaped}')">📋 Copy Command</button>
                 </div>
                 <table class="show-table"><thead>
-                    <tr><th>S</th><th>E</th><th>Keep</th><th>Score</th><th>Res</th><th>Torrent</th><th>Reason</th><th>Path</th></tr>
+                    <tr><th>S</th><th>E</th><th>Keep</th><th>Score</th><th>Res</th><th>Source</th><th>Reason</th><th>Path</th></tr>
                 </thead><tbody id="tbody-{show_id}"></tbody></table>
                 <div class="show-more" id="more-{show_id}" style="display:none;">
                     <button class="btn btn-secondary" onclick="loadMore('{show_id}')">📥 Load more...</button>
@@ -1739,6 +1823,35 @@ def generate_html_report(
         .keep-yes {{ color: var(--accent-green); font-weight: bold; }}
         .keep-no {{ color: var(--accent-red); }}
         .keep-seed {{ color: var(--accent-yellow); font-weight: bold; }}
+        .keep-arr {{ color: var(--accent-orange); font-weight: bold; }}
+        .source-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.7rem;
+            font-weight: 500;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 160px;
+        }}
+        .source-badge.seeding {{
+            background: rgba(255, 230, 109, 0.2);
+            color: var(--accent-yellow);
+            border: 1px solid var(--accent-yellow);
+        }}
+        .source-badge.arr-managed {{
+            background: rgba(255, 107, 129, 0.2);
+            color: var(--accent-orange);
+            border: 1px solid var(--accent-orange);
+        }}
+        .source-badge.arr-upgrade {{
+            background: rgba(0, 184, 148, 0.2);
+            color: var(--accent-green);
+            border: 1px solid var(--accent-green);
+        }}
         .torrent-badge {{
             display: inline-flex;
             align-items: center;
@@ -1776,6 +1889,7 @@ def generate_html_report(
         .filter-btn:hover {{ background: var(--bg-primary); }}
         .filter-btn.active {{ background: var(--accent-blue); color: var(--bg-primary); }}
         .filter-btn.active-yellow {{ background: var(--accent-yellow); color: var(--bg-primary); }}
+        .filter-btn.active-orange {{ background: var(--accent-orange); color: var(--bg-primary); }}
         .filter-btn.active-red {{ background: var(--accent-red); color: white; }}
         .filter-btn.active-green {{ background: var(--accent-green); color: var(--bg-primary); }}
         .qbit-link {{
@@ -1950,6 +2064,23 @@ def generate_html_report(
             </div>
         </div>
 
+        <!-- Sonarr/Radarr Status -->
+        <div class="section" style="background: linear-gradient(135deg, rgba(255, 107, 129, 0.1), rgba(107, 203, 255, 0.1));">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:15px;">
+                <div>
+                    <h3 style="color:var(--accent-orange);margin-bottom:8px;">📺 Sonarr/Radarr Integration</h3>
+                    <p style="color:var(--text-secondary);font-size:0.9rem;">
+                        <strong style="color:var(--accent-orange);">{summary.get("arr_managed_files", 0):,}</strong> Dateien von Arr verwaltet &nbsp;|&nbsp;
+                        <strong style="color:var(--accent-green);">{summary.get("arr_protected", 0):,}</strong> vor Löschung geschützt &nbsp;|&nbsp;
+                        <strong style="color:var(--accent-yellow);">{summary.get("arr_upgrade_recommended", 0):,}</strong> Upgrade empfohlen
+                    </p>
+                    <p style="color:var(--text-secondary);font-size:0.8rem;margin-top:5px;">
+                        ℹ️ Von Arr verwaltete Dateien werden automatisch geschützt. Upgrades werden von Sonarr/Radarr verwaltet.
+                    </p>
+                </div>
+            </div>
+        </div>
+
         <!-- Warnings -->
         {warnings_html}
 
@@ -2017,6 +2148,7 @@ def generate_html_report(
             <div class="filter-buttons">
                 <button class="filter-btn active" onclick="filterByStatus('all', this)">📁 Alle</button>
                 <button class="filter-btn" onclick="filterByStatus('seeding', this)">🌱 Seeding</button>
+                <button class="filter-btn" onclick="filterByStatus('arr', this)">📺 Arr-Managed</button>
                 <button class="filter-btn" onclick="filterByStatus('deletable', this)">🗑️ Löschbar</button>
                 <button class="filter-btn" onclick="filterByStatus('keep', this)">✓ Behalten</button>
             </div>
@@ -2090,15 +2222,24 @@ Language Scoring:
             const start = loadedRows[showId], end = Math.min(start + count, data.length);
             for (let i = start; i < end; i++) {{
                 const r = data[i], tr = document.createElement('tr');
-                tr.setAttribute('data-status', r.keep === 'YES' ? 'keep' : (r.is_seeding ? 'seeding' : 'deletable'));
-                const keepClass = r.keep === 'YES' ? 'keep-yes' : (r.keep === 'SEED' ? 'keep-seed' : 'keep-no');
+                tr.setAttribute('data-status', r.keep === 'YES' ? 'keep' : (r.is_seeding ? 'seeding' : (r.arr_managed ? 'arr' : 'deletable')));
+                const keepClass = r.keep === 'YES' ? 'keep-yes' : (r.keep === 'SEED' ? 'keep-seed' : (r.arr_managed ? 'keep-arr' : 'keep-no'));
                 const reasonClass = r.keep === 'YES' ? 'reason-cell keep' : 'reason-cell';
-                let torrentCell = '<span class="torrent-badge not-seeding">—</span>';
+                // Build source cell showing seeding, arr-managed, or plain status
+                let sourceCell = '<span class="source-badge">—</span>';
                 if (r.is_seeding) {{
-                    const tName = (r.torrent_name || 'Torrent').substring(0, 20);
-                    torrentCell = '<span class="torrent-badge seeding" title="' + esc(r.torrent_name || '') + '">🌱 ' + esc(tName) + '</span>';
+                    const tName = (r.torrent_name || 'Torrent').substring(0, 18);
+                    sourceCell = '<span class="source-badge seeding" title="Seeding: ' + esc(r.torrent_name || '') + '">🌱 ' + esc(tName) + '</span>';
+                }} else if (r.arr_managed) {{
+                    const arrName = r.arr_instance || r.arr_app || 'Arr';
+                    const arrInfo = r.arr_quality ? arrName + ' (' + r.arr_quality + ')' : arrName;
+                    const arrTitle = 'Managed by ' + (r.arr_app || 'Arr') + ': ' + (r.arr_title || '') + (r.arr_upgrade_recommended ? ' [UPGRADE]' : '');
+                    sourceCell = '<span class="source-badge arr-managed" title="' + esc(arrTitle) + '">📺 ' + esc(arrInfo.substring(0,18)) + '</span>';
+                    if (r.arr_upgrade_recommended) {{
+                        sourceCell = '<span class="source-badge arr-upgrade" title="' + esc(arrTitle) + '">⬆️ ' + esc(arrInfo.substring(0,18)) + '</span>';
+                    }}
                 }}
-                tr.innerHTML = '<td>' + r.season + '</td><td>' + r.episode + '</td><td class="' + keepClass + '">' + r.keep + '</td><td class="score-cell" onclick="showScoreDetails(\\'' + esc(showName) + '\\',' + i + ')">' + r.score + '</td><td>' + r.res + '</td><td style="max-width:180px;">' + torrentCell + '</td><td class="' + reasonClass + '" title="' + esc(r.reason) + '">' + esc(r.reason).substring(0,30) + '</td><td class="path" title="' + esc(r.path) + '">' + esc(r.filename) + '</td>';
+                tr.innerHTML = '<td>' + r.season + '</td><td>' + r.episode + '</td><td class="' + keepClass + '">' + r.keep + '</td><td class="score-cell" onclick="showScoreDetails(\\'' + esc(showName) + '\\',' + i + ')">' + r.score + '</td><td>' + r.res + '</td><td style="max-width:180px;">' + sourceCell + '</td><td class="' + reasonClass + '" title="' + esc(r.reason) + '">' + esc(r.reason).substring(0,30) + '</td><td class="path" title="' + esc(r.path) + '">' + esc(r.filename) + '</td>';
                 tbody.appendChild(tr);
             }}
             loadedRows[showId] = end;
@@ -2156,12 +2297,13 @@ Language Scoring:
         let currentFilter = 'all';
         function filterByStatus(status, btn) {{
             currentFilter = status;
-            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active', 'active-yellow', 'active-red', 'active-green'));
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active', 'active-yellow', 'active-red', 'active-green', 'active-orange'));
             if (status === 'seeding') btn.classList.add('active-yellow');
+            else if (status === 'arr') btn.classList.add('active-orange');
             else if (status === 'deletable') btn.classList.add('active-red');
             else if (status === 'keep') btn.classList.add('active-green');
             else btn.classList.add('active');
-            
+
             document.querySelectorAll('tr[data-status]').forEach(row => {{
                 if (status === 'all') row.style.display = '';
                 else row.style.display = row.getAttribute('data-status') === status ? '' : 'none';

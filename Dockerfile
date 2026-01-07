@@ -9,7 +9,7 @@ FROM python:3.11-slim-bookworm
 LABEL maintainer="Media Audit Project" \
       org.opencontainers.image.title="Media Audit" \
       org.opencontainers.image.description="Scan media libraries for duplicates with Sonarr/Radarr/qBittorrent integration" \
-      org.opencontainers.image.version="3.0.0" \
+      org.opencontainers.image.version="3.4.0" \
       org.opencontainers.image.source="https://github.com/SynMaki/unraid-media-audit"
 
 # =============================================================================

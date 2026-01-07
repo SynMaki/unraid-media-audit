@@ -486,11 +486,30 @@ class ServarrClient:
         """Get all episode files from Sonarr."""
         files: Dict[str, ManagedFile] = {}
         series_list = self.get_all_series()
-        
+
         LOG.info(f"[{self.instance.name}] Processing {len(series_list)} series from Sonarr")
+
+        # Log path mapping configuration
+        if self.instance.path_mappings:
+            LOG.info(f"[{self.instance.name}] Path mappings configured: {len(self.instance.path_mappings)}")
+            for pm in self.instance.path_mappings:
+                LOG.info(f"[{self.instance.name}]   '{pm.servarr_path}' -> '{pm.local_path}'")
+        else:
+            LOG.warning(f"[{self.instance.name}] No path mappings configured!")
+            LOG.warning(f"[{self.instance.name}] Sonarr paths will NOT match local scanner paths!")
+            LOG.warning(f"[{self.instance.name}] Configure path_mappings like: /tv -> /media/plexmedia/Serien")
+
+        # Log first series path for debugging
+        if series_list:
+            first_series = series_list[0]
+            LOG.info(f"[{self.instance.name}] First series example:")
+            LOG.info(f"[{self.instance.name}]   Title: {first_series.get('title', 'N/A')}")
+            LOG.info(f"[{self.instance.name}]   Path:  {first_series.get('path', 'N/A')}")
+
         episode_file_count = 0
         skipped_root_folder = 0
-        
+        no_mapping_warning_shown = False
+
         for series in series_list:
             series_id = series.get("id", 0)
             series_title = series.get("title", "Unknown")
@@ -518,10 +537,13 @@ class ServarrClient:
                 
                 # Log first few path mappings for debugging
                 if episode_file_count <= 5:
-                    LOG.debug(f"[{self.instance.name}] Sonarr path: {path}")
-                    LOG.debug(f"[{self.instance.name}] Local path:  {local_path}")
-                    if path == local_path:
-                        LOG.debug(f"[{self.instance.name}] ⚠️ No path mapping applied!")
+                    LOG.info(f"[{self.instance.name}] Episode file #{episode_file_count}:")
+                    LOG.info(f"[{self.instance.name}]   Sonarr path: {path}")
+                    LOG.info(f"[{self.instance.name}]   Local path:  {local_path}")
+                    if path == local_path and not no_mapping_warning_shown:
+                        LOG.warning(f"[{self.instance.name}] ⚠️ No path mapping applied!")
+                        LOG.warning(f"[{self.instance.name}] Files will NOT be matched to scanned files!")
+                        no_mapping_warning_shown = True
                 
                 quality_obj = ef.get("quality", {}).get("quality", {})
                 custom_formats = [cf.get("name", "") for cf in ef.get("customFormats", []) if cf.get("name")]
@@ -557,7 +579,29 @@ class ServarrClient:
     def _get_radarr_files(self) -> Dict[str, ManagedFile]:
         files: Dict[str, ManagedFile] = {}
         movie_list = self.get_all_movies()
-        
+
+        LOG.info(f"[{self.instance.name}] Processing {len(movie_list)} movies from Radarr")
+
+        # Log path mapping configuration
+        if self.instance.path_mappings:
+            LOG.info(f"[{self.instance.name}] Path mappings configured: {len(self.instance.path_mappings)}")
+            for pm in self.instance.path_mappings:
+                LOG.info(f"[{self.instance.name}]   '{pm.servarr_path}' -> '{pm.local_path}'")
+        else:
+            LOG.warning(f"[{self.instance.name}] No path mappings configured!")
+            LOG.warning(f"[{self.instance.name}] Radarr paths will NOT match local scanner paths!")
+
+        # Log first movie path for debugging
+        movies_with_files = [m for m in movie_list if m.get("hasFile", False)]
+        if movies_with_files:
+            first_movie = movies_with_files[0]
+            LOG.info(f"[{self.instance.name}] First movie example:")
+            LOG.info(f"[{self.instance.name}]   Title: {first_movie.get('title', 'N/A')}")
+            LOG.info(f"[{self.instance.name}]   Path:  {first_movie.get('path', 'N/A')}")
+
+        movie_file_count = 0
+        no_mapping_warning_shown = False
+
         for movie in movie_list:
             if not movie.get("hasFile", False):
                 continue
@@ -579,8 +623,20 @@ class ServarrClient:
             path = mf_data.get("path", "")
             if not path:
                 continue
-            
+
+            movie_file_count += 1
             local_path = self.instance.map_path_to_local(path)
+
+            # Log first few path mappings for debugging
+            if movie_file_count <= 5:
+                LOG.info(f"[{self.instance.name}] Movie file #{movie_file_count}:")
+                LOG.info(f"[{self.instance.name}]   Radarr path: {path}")
+                LOG.info(f"[{self.instance.name}]   Local path:  {local_path}")
+                if path == local_path and not no_mapping_warning_shown:
+                    LOG.warning(f"[{self.instance.name}] ⚠️ No path mapping applied!")
+                    LOG.warning(f"[{self.instance.name}] Files will NOT be matched to scanned files!")
+                    no_mapping_warning_shown = True
+
             quality_obj = mf_data.get("quality", {}).get("quality", {})
             custom_formats = [cf.get("name", "") for cf in mf_data.get("customFormats", []) if cf.get("name")]
             cf_score = mf_data.get("customFormatScore", 0)
@@ -601,8 +657,10 @@ class ServarrClient:
                 instance_name=self.instance.name, instance_type=self.instance.app_type.value,
             )
             files[local_path] = mf
+
+        LOG.info(f"[{self.instance.name}] Loaded {len(files)} movie files from {len(movies_with_files)} movies with files")
         return files
-    
+
     def get_queue_paths(self) -> Dict[str, ProtectionEvidence]:
         paths: Dict[str, ProtectionEvidence] = {}
         for item in self.get_queue():
