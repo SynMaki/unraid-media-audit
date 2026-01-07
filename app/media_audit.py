@@ -2,8 +2,14 @@
 """
 media_audit.py — Unraid Plex/Sonarr/Torrents Audit (dry-run by default)
 
-Version: 3.4.1
+Version: 3.4.2
 Changelog:
+- 2026-01-07 [AI] v3.4.2 - Torrent Ratio Display
+  - NEW: Show torrent ratio for seeding files in HTML report
+  - NEW: Ratio column in CSV exports (missing_hardlinks.csv, all_seeding.csv, seeding_not_in_arr.csv)
+  - NEW: Ratio displayed in "Reason" column for seeding files (e.g., "SEEDING: TorrentName (Ratio: 1.25)")
+  - Helps decide which seeding files can be safely deleted (high ratio = already shared enough)
+
 - 2026-01-07 [AI] v3.4.1 - Missing Hardlinks Detection
   - NEW: Missing Hardlinks report - shows files that are in BOTH Sonarr AND qBittorrent but WITHOUT hardlink (wasted space!)
   - NEW: Seeding overview section in HTML report
@@ -76,7 +82,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "3.4.1"
+VERSION = "3.4.2"
 
 # =============================================================================
 # CONFIGURATION
@@ -465,6 +471,7 @@ class QBittorrentClient:
                     "torrent_path": abs_path,
                     "container_path": container_file_path,
                     "mapping_applied": mapping_applied,
+                    "ratio": torrent.get("ratio", 0.0),  # Share ratio
                 }
 
                 path_map[abs_path] = info
@@ -1198,6 +1205,7 @@ class MediaFile:
     torrent_hash: Optional[str] = None
     torrent_name: Optional[str] = None
     torrent_file_name: Optional[str] = None  # Original filename in torrent
+    torrent_ratio: Optional[float] = None  # Share ratio from qBittorrent
     
     # Servarr (Sonarr/Radarr) integration
     arr_managed: bool = False
@@ -1632,13 +1640,15 @@ def generate_html_report(
                 # Build reason - include seeding status
                 is_seeding = r.get('is_seeding', False)
                 torrent_name = r.get('torrent_name', '')
-                
+                torrent_ratio = r.get('torrent_ratio', 0.0)
+
                 if keep == 'YES':
                     reason = "✓ Best version"
                 elif is_seeding:
-                    reason = f"🌱 SEEDING (protected)"
+                    ratio_str = f" (Ratio: {torrent_ratio:.2f})" if torrent_ratio else ""
+                    reason = f"🌱 SEEDING{ratio_str}"
                     if torrent_name:
-                        reason = f"🌱 SEEDING: {torrent_name[:30]}"
+                        reason = f"🌱 SEEDING: {torrent_name[:25]}{ratio_str}"
                 else:
                     reasons = []
                     diff = best_score - current_score
@@ -1668,7 +1678,8 @@ def generate_html_report(
                     'score_details': score_details,
                     'is_seeding': is_seeding,
                     'torrent_name': torrent_name,
-                    'torrent_file_name': r.get('torrent_file_name', '')
+                    'torrent_file_name': r.get('torrent_file_name', ''),
+                    'torrent_ratio': torrent_ratio
                 })
         return json.dumps(show_data, ensure_ascii=False)
     
@@ -2442,6 +2453,7 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
                 "note": row_note, "ffprobe_error": m.ffprobe_error or "",
                 "is_seeding": m.is_seeding, "torrent_name": m.torrent_name or "",
                 "torrent_file_name": m.torrent_file_name or "",
+                "torrent_ratio": m.torrent_ratio or 0.0,
                 # Servarr fields
                 "arr_managed": m.arr_managed, "arr_app": m.arr_app or "",
                 "arr_instance": m.arr_instance or "", "arr_media_id": m.arr_media_id or "",
@@ -2536,6 +2548,7 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
             missing_hardlinks.append({
                 "path": m.path,
                 "size": m.size,
+                "ratio": m.torrent_ratio or 0.0,
                 "arr_app": m.arr_app or "",
                 "arr_instance": m.arr_instance or "",
                 "arr_title": m.arr_title or "",
@@ -2551,6 +2564,7 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
             seeding_not_arr.append({
                 "path": m.path,
                 "size": m.size,
+                "ratio": m.torrent_ratio or 0.0,
                 "torrent_name": m.torrent_name or "",
                 "torrent_hash": m.torrent_hash or "",
                 "nlink": m.nlink,
@@ -2563,6 +2577,7 @@ def generate_reports(media, ep_groups, hardlinked, delete_under, avoid_mode, avo
             all_seeding.append({
                 "path": m.path,
                 "size": m.size,
+                "ratio": m.torrent_ratio or 0.0,
                 "torrent_name": m.torrent_name or "",
                 "arr_managed": m.arr_managed,
                 "arr_app": m.arr_app or "",
@@ -2817,10 +2832,11 @@ def main() -> int:
                         m.torrent_hash = torrent_info.get("torrent_hash")
                         m.torrent_name = torrent_info.get("torrent_name")
                         m.torrent_file_name = torrent_info.get("torrent_file_name")
+                        m.torrent_ratio = torrent_info.get("ratio")
                         seeding_count += 1
-                        
+
                         LOG.debug(f"Protected (active torrent {state}): {m.path}")
-                        
+
                         # Also mark all hardlinks to this file!
                         inode_key = (m.dev, m.inode)
                         if inode_key in media_by_inode:
@@ -2830,6 +2846,7 @@ def main() -> int:
                                     linked.torrent_hash = torrent_info.get("torrent_hash")
                                     linked.torrent_name = torrent_info.get("torrent_name")
                                     linked.torrent_file_name = torrent_info.get("torrent_file_name")
+                                    linked.torrent_ratio = torrent_info.get("ratio")
                                     matched_by_hardlink += 1
                                     seeding_count += 1
                                     LOG.debug(f"Protected (hardlink to active torrent): {linked.path}")

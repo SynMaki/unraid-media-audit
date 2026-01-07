@@ -1,7 +1,7 @@
 # Media Audit - Docker Container for Unraid
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.4.1-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-3.4.2-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/github/license/SynMaki/unraid-media-audit?style=flat-square" alt="License">
 </p>
 
@@ -11,12 +11,11 @@
 
 ---
 
-## What's New in v3.4.1
+## What's New in v3.4.2
 
-- **Missing Hardlinks Detection**: Find files that exist in BOTH Sonarr AND qBittorrent but WITHOUT hardlink = wasted disk space!
-- **Seeding Overview**: See all seeding files with hardlink status
-- **Improved Path Mapping**: Better logging and debugging for path mapping issues
-- **New CSV Reports**: `missing_hardlinks.csv`, `all_seeding.csv`, `seeding_not_in_arr.csv`
+- **Torrent Ratio Display**: See the share ratio for each seeding file - helps decide what to delete!
+- **Ratio in Reports**: CSV exports and HTML report now show torrent ratio
+- **Smarter Decisions**: High ratio (e.g., 2.0+) = file has been shared enough, safe to delete
 
 ---
 
@@ -322,6 +321,11 @@ docker logs -f media-audit  # Follow live
 ---
 
 ## Changelog
+
+### v3.4.2 (2026-01-07)
+- NEW: Torrent ratio display for seeding files
+- NEW: Ratio column in CSV exports
+- NEW: Ratio shown in HTML report reason column
 
 ### v3.4.1 (2026-01-07)
 - NEW: Missing Hardlinks detection
